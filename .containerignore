@@ -1,0 +1,4 @@
+# Never bake the install config into the image.
+.env
+.env.*
+.git

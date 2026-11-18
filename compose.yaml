@@ -1,0 +1,41 @@
+services:
+  opencave:
+    build: .
+    image: localhost/opencave:latest
+    container_name: opencave
+    command: ["serve", "--hostname", "0.0.0.0", "--port", "4096"]
+    ports: ["${BIND_ADDR:-127.0.0.1}:${PORT:-4096}:4096"]
+    environment:
+      OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:?set it in .env}
+    volumes:
+      - "${WORKSPACE}:/workspace/${WORKSPACE_NAME:-workspace}:z"
+      - "${DATA}/share:/root/.local/share/opencode:z"
+      - "${DATA}/bin:/root/.local/bin:z"
+      - "${DATA}/cache:/root/.cache:z"
+      - "${DATA}/state:/root/.local/state/opencode:z"
+      - "${DATA}/config:/root/.config/opencode:z"
+      - "${DATA}/agents:/root/.agents:z"
+      - "${DATA}/openchamber/config/chats:/root/.config/openchamber/chats:z"
+    working_dir: /workspace/${WORKSPACE_NAME:-workspace}
+    security_opt: ["no-new-privileges:true"]
+
+  openchamber:
+    profiles: ["openchamber"]
+    image: localhost/opencave:latest
+    container_name: opencave-openchamber
+    entrypoint: ["npx", "--yes", "@openchamber/web@${OPENCHAMBER_VERSION:-2.7.2}", "--foreground", "--port", "3000"]
+    ports: ["127.0.0.1:${OPENCHAMBER_PORT:-3000}:3000"]
+    environment:
+      OPENCODE_HOST: http://opencave:4096
+      OPENCODE_SKIP_START: "true"
+      OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:?set it in .env}
+      OPENCHAMBER_UI_PASSWORD: ${OPENCHAMBER_UI_PASSWORD:-}
+      OPENCHAMBER_HOST: 0.0.0.0
+    volumes:
+      - "${WORKSPACE}:/workspace/${WORKSPACE_NAME:-workspace}:z"
+      - "${DATA}/openchamber/config:/root/.config/openchamber:z"
+      - "${DATA}/openchamber/npm:/root/.npm:z"
+    working_dir: /workspace/${WORKSPACE_NAME:-workspace}
+    depends_on: [opencave]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
