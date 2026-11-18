@@ -20,20 +20,23 @@ usage() {
     printf '%s\n\n' 'Setup: ./setup.sh [--workspace DIR] [--port N] [--no-import-auth]'
   fi
   cat <<'HELP'
-opencave                Show help and current settings
-opencave [DIR]          Open a TUI in DIR (use . for the current folder)
-opencave shell          Open Bash with shared tools and config
-opencave creds          Show service URLs and passwords
-opencave start          Set up or enable and start the user service
-opencave stop           Stop and disable the service
-opencave restart        Restart the service
-opencave status         Show the unit and container status
-opencave logs           Follow the service journal
-opencave reconfigure    Change the mode or service settings (setup flags accepted)
-opencave remove-service Return to on-demand use and keep data
-opencave import-auth    Import saved credentials from host OpenCode
-opencave update         Rebuild the image and refresh a running service
-opencave version        Show the installed image's OpenCode version
+opencave                    Open a TUI in the current folder
+opencave DIR                Open a TUI in DIR
+opencave shell              Open Bash with shared tools and config
+opencave help               Show this help
+
+opencave service-start      Set up or enable and start the user service
+opencave service-stop       Stop and disable the service
+opencave service-restart    Restart the service
+opencave service-status     Show the unit and container status
+opencave service-logs       Follow the service journal
+opencave service-remove     Return to on-demand use and keep data
+
+opencave creds              Show service URLs and passwords
+opencave reconfigure        Change the mode or service settings (setup flags accepted)
+opencave import-auth        Import saved credentials from host OpenCode
+opencave update             Rebuild the image and refresh a running service
+opencave version            Show the installed image's OpenCode version
 opencave uninstall [--yes]
 HELP
 }
@@ -111,7 +114,7 @@ require_install() {
 
 require_service() {
   require_install
-  [ -f "$UNIT_FILE" ] || die "use 'opencave start' to install the service"
+  [ -f "$UNIT_FILE" ] || die "use 'opencave service-start' to install the service"
 }
 
 compose() (
@@ -463,6 +466,9 @@ open_session() {
     [ "$#" -le 1 ] || die "usage: opencave [DIR]"
     dir=$(absolute_path "${1:-$CALL_DIR}")
     [ -d "$dir" ] || die "not a directory: $dir"
+    if contains_path "$dir" "$(realpath -m -- "$HOME")"; then
+      die "refusing to mount $dir: it contains your home directory"
+    fi
     name=${dir##*/}
     workdir=/workspace/${name:-workspace}
     mounts=( -v "$dir:$workdir:z" "${mounts[@]}" )
@@ -487,10 +493,10 @@ fi
 
 cmd=${1:-}
 case "$cmd" in
-  shell|creds|--service-up|--service-ready|--service-down|start|stop|restart|status|logs|update|version|import-auth|reconfigure|remove-service|uninstall)
+  shell|creds|--service-up|--service-ready|--service-down|service-start|service-stop|service-restart|service-status|service-logs|service-remove|update|version|import-auth|reconfigure|uninstall)
     shift ;;
   '')
-    if [ "${0##*/}" = opencave ]; then cmd=info; else cmd=setup; fi ;;
+    if [ "${0##*/}" = opencave ]; then cmd=session; else cmd=setup; fi ;;
   -*) cmd=setup ;;
   *) cmd=session ;;
 esac
@@ -499,7 +505,7 @@ esac
 # Serialize configuration and service changes. The unit's callbacks run
 # while systemctl is waiting, so they don't acquire this lock.
 case "$cmd" in
-  setup|start|stop|restart|update|reconfigure|remove-service|uninstall|import-auth)
+  setup|service-start|service-stop|service-restart|update|reconfigure|service-remove|uninstall|import-auth)
     exec 9< "$SCRIPT_DIR"
     flock -x 9 ;;
 esac
@@ -510,31 +516,6 @@ if [ "$cmd" != shell ] && [ "$cmd" != session ]; then
   WORKSPACE=$(absolute_path "${WORKSPACE:-$HOME/opencave}" "$SCRIPT_DIR")
 fi
 DATA=$(absolute_path "${DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/opencave/data}" "$SCRIPT_DIR")
-
-if [ "$cmd" = info ]; then
-  usage
-  printf '\n'
-  if [ -f "$ENV_FILE" ]; then
-    if [ -f "$UNIT_FILE" ]; then
-      service_status=inactive
-      systemctl --user is-active --quiet "$SERVICE" 2>/dev/null && service_status=active
-      printf 'Mode:      service (%s)\n' "$service_status"
-      printf 'Workspace: %s\n' "$WORKSPACE"
-    else
-      printf 'Mode:      on-demand\n'
-      printf 'Workspace: per session (opencave [DIR])\n'
-    fi
-    printf 'Data:      %s\n' "$DATA"
-    printf 'Config:    %s\n' "$ENV_FILE"
-    if [ -f "$UNIT_FILE" ]; then
-      printf '\n'
-      print_status
-    fi
-  else
-    printf 'Not installed yet. Run ./setup.sh.\n'
-  fi
-  exit 0
-fi
 
 if [ "$cmd" = creds ]; then
   [ "$#" -eq 0 ] || die "usage: opencave creds"
@@ -592,7 +573,7 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 if [ -n "$workspace_flag$port_flag" ] || [ "$import_first" = no ]; then
-  case "$cmd" in setup|reconfigure|start) ;; *) die "setup flags are unavailable for $cmd" ;; esac
+  case "$cmd" in setup|reconfigure|service-start) ;; *) die "setup flags are unavailable for $cmd" ;; esac
 fi
 [ "$yes_flag" = no ] || [ "$cmd" = uninstall ] || die "--yes is for uninstall"
 
@@ -602,18 +583,18 @@ if [ -f "$UNIT_FILE" ] && systemctl --user is-active --quiet "$SERVICE"; then
 fi
 unit_changed=no
 case "$cmd" in
-  status)
+  service-status)
     require_service
     systemctl --user status "$SERVICE" --no-pager || true
     podman ps -a --filter 'name=^opencave(-openchamber)?$'
     exit ;;
-  logs) require_service; exec journalctl --user -u "$SERVICE" -f --no-pager ;;
-  stop) require_service; stop_service; printf 'OpenCave stopped (data kept). Start again with opencave start.\n'; exit ;;
-  remove-service) remove_service; printf 'Service removed; using on-demand. Data kept.\n'; exit ;;
+  service-logs) require_service; exec journalctl --user -u "$SERVICE" -f --no-pager ;;
+  service-stop) require_service; stop_service; printf 'OpenCave stopped (data kept). Start again with opencave service-start.\n'; exit ;;
+  service-remove) remove_service; printf 'Service removed; using on-demand. Data kept.\n'; exit ;;
   uninstall) uninstall; exit ;;
   import-auth) require_install; import_auth; exit ;;
   version) require_install; image_version; exit ;;
-  restart)
+  service-restart)
     require_service
     require_service_deps
     setup_unit
@@ -637,12 +618,12 @@ esac
 
 mode=ondemand had_unit=no config_changed=no
 if [ -f "$UNIT_FILE" ]; then mode=service; had_unit=yes; fi
-if [ "$cmd" = start ] || [ -n "$workspace_flag$port_flag" ]; then mode=service; fi
+if [ "$cmd" = service-start ] || [ -n "$workspace_flag$port_flag" ]; then mode=service; fi
 
 if [ -t 0 ] && [ -z "$workspace_flag$port_flag" ] &&
   { [ "$first_install" = yes ] || [ "$cmd" = reconfigure ] ||
-    { [ "$cmd" = start ] && [ ! -f "$UNIT_FILE" ]; }; }; then
-  if [ "$cmd" != start ]; then
+    { [ "$cmd" = service-start ] && [ ! -f "$UNIT_FILE" ]; }; }; then
+  if [ "$cmd" != service-start ]; then
     default=no
     if [ "$mode" = service ]; then default=yes; fi
     if ask_yes "Run OpenCode as a background service on 127.0.0.1:$PORT?" "$default"; then
@@ -671,7 +652,7 @@ if [ "$mode" = service ]; then
     validate_port "$OPENCHAMBER_PORT"
     [ "$OPENCHAMBER_PORT" != "$PORT" ] || die "OpenCode and OpenChamber need different host ports"
   fi
-  if { [ "$first_install" = yes ] || [ "$cmd" = reconfigure ] || [ "$cmd" = start ]; } && port_busy "$PORT"; then
+  if { [ "$first_install" = yes ] || [ "$cmd" = reconfigure ] || [ "$cmd" = service-start ]; } && port_busy "$PORT"; then
     die "port $PORT is already in use; pass --port to choose another"
   fi
 fi
@@ -707,12 +688,12 @@ fi
 
 if [ "$mode" = ondemand ]; then
   remove_service
-  printf 'OpenCave is ready (on-demand). Start with opencave . or opencave shell.\n'
+  printf 'OpenCave is ready (on-demand). Start with opencave or opencave shell.\n'
   exit
 fi
 
 setup_unit
-if { [ "$cmd" = start ] || [ "$had_unit" = no ]; } &&
+if { [ "$cmd" = service-start ] || [ "$had_unit" = no ]; } &&
   ! systemctl --user is-enabled --quiet "$SERVICE"; then
   systemctl --user enable "$SERVICE" >/dev/null
   configure_linger
@@ -720,7 +701,7 @@ fi
 if [ "$service_active" = yes ] && { [ "$config_changed" = yes ] || [ "$unit_changed" = yes ]; }; then
   systemctl --user restart "$SERVICE"
   print_access
-elif [ "$cmd" = start ] || [ "$had_unit" = no ] ||
+elif [ "$cmd" = service-start ] || [ "$had_unit" = no ] ||
   { [ "$service_active" = no ] && systemctl --user is-enabled --quiet "$SERVICE"; }; then
   systemctl --user start "$SERVICE"
   if [ "$service_active" = yes ]; then wait_for_http; fi

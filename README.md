@@ -29,18 +29,18 @@ settings.
 ## Use
 
 ```sh
-opencave                     # help and current settings
-opencave .                   # TUI in the current folder
+opencave                     # TUI in the current folder
 opencave ../project          # TUI in another folder
 opencave shell               # Bash with shared tools and config
+opencave help                # show commands
 opencave creds               # show service URLs and passwords
-opencave start               # enable and start the systemd user service
-opencave stop                # stop and disable the service
-opencave restart
-opencave status
-opencave logs
+opencave service-start       # enable and start the systemd user service
+opencave service-stop        # stop and disable the service
+opencave service-restart
+opencave service-status
+opencave service-logs
 opencave reconfigure         # change mode, workspace, or OpenChamber
-opencave remove-service      # return to on-demand and keep data
+opencave service-remove      # return to on-demand and keep data
 opencave update              # rebuild the image and refresh a running service
 opencave version             # version in the installed image
 opencave uninstall           # prompts before removal
@@ -49,15 +49,20 @@ opencave uninstall           # prompts before removal
 Service mode mounts `~/opencave` by default. OpenCode listens at
 <http://127.0.0.1:4096/> with username `opencode`. If enabled, OpenChamber
 listens at <http://127.0.0.1:3000/> and uses a separate UI password. Its first
-launch downloads the pinned npm package. Use `opencave status` and
-`opencave logs` for OpenCode, or `podman logs opencave-openchamber` for the UI.
+launch downloads the pinned npm package. OpenChamber is pinned by
+`OPENCHAMBER_VERSION`; `opencave update` does not change it. Set a new version
+in `.env` and run `opencave service-restart`. Use `opencave service-status` and
+`opencave service-logs` for OpenCode, or `podman logs opencave-openchamber` for
+the UI.
 
-In service mode, `opencave creds` prints the URLs and passwords. Setup, `start`,
-and `restart` also show them when their output goes to a terminal.
+In service mode, `opencave creds` prints the URLs and passwords. Setup,
+`service-start`, and `service-restart` also show them when their output goes to
+a terminal.
 Passwords and settings also live in the checkout's mode-0600 `.env`
 (`~/.local/share/opencave/src/.env` for the one-line install). Read
 `OPENCODE_SERVER_PASSWORD` and `OPENCHAMBER_UI_PASSWORD` there. The file
-accepts literal `KEY=value` lines. Use `opencave restart` after changing it.
+accepts literal `KEY=value` lines. Use `opencave service-restart` after
+changing it.
 
 ## Data and isolation
 
@@ -85,7 +90,8 @@ edit the `Containerfile` and run `opencave update`.
 The containers run rootless and keep separate configuration from host OpenCode.
 An agent can modify its mounted workspace and access the shared OpenCave data.
 Choose folders accordingly, especially on SELinux systems where Podman
-relabels bind mounts.
+relabels bind mounts. OpenCave refuses to mount a directory that contains your
+home directory.
 
 `opencave uninstall` closes OpenCave sessions and removes the CLI link,
 service, settings, and any data directory marked as belonging to that
@@ -117,9 +123,9 @@ register it with the OpenCode v2 command below.
 opencode mcp add codebase-memory-mcp --global -- /root/.local/bin/codebase-memory-mcp
 ```
 
-Start a new session or run `opencave restart` for the service. Index the repo
-at its path under `/workspace/<folder>` to avoid needing approval for a
-top-level root.
+Start a new session or run `opencave service-restart` for the service. Index
+the repo at its path under `/workspace/<folder>` to avoid needing approval for
+a top-level root.
 
 Files written to the container's own filesystem disappear when the container
 is removed. If an MCP lets you choose its state directory, point it at
