@@ -306,16 +306,13 @@ build_image() {
   [ "$(podman info --format '{{.Host.Security.Rootless}}')" = true ] || die "OpenCave requires rootless Podman"
   if podman image exists "$IMAGE"; then image_exists=yes; fi
   pinned=$(sed -n 's/^ARG OPENCODE_TAG=//p' Containerfile)
-  target=$pinned
-  if [ "${OPENCAVE_PIN:-0}" != 1 ]; then
-    target=$(curl --disable -fsSL --max-time 15 \
-      'https://api.github.com/repos/anomalyco/opencode/releases?per_page=100' 2>/dev/null |
-      sed -n 's/.*"tag_name": *"v\(2\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' |
-      sort -Vr | sed -n '1p') || target=
-    if [ -z "$target" ]; then
-      [ "$image_exists" = no ] || die "could not resolve OpenCode releases; keeping the installed image"
-      target=$pinned
-    fi
+  target=$(curl --disable -fsSL --max-time 15 \
+    'https://api.github.com/repos/anomalyco/opencode/releases?per_page=100' 2>/dev/null |
+    sed -n 's/.*"tag_name": *"v\(2\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' |
+    sort -Vr | sed -n '1p') || target=
+  if [ -z "$target" ]; then
+    [ "$image_exists" = no ] || die "could not resolve OpenCode releases; keeping the installed image"
+    target=$pinned
   fi
 
   if [ "$image_exists" = yes ]; then
@@ -323,11 +320,7 @@ build_image() {
       [ -n "$current" ] || die "could not determine the installed OpenCode version"
     if [ "$current" != "$target" ] &&
       [ "$(printf '%s\n%s\n' "$current" "$target" | sort -V | sed -n '1p')" = "$target" ]; then
-      [ "${OPENCAVE_PIN:-0}" = 1 ] || die "resolved tag $target is older than installed $current"
-      [ "$service_active" = no ] || die "stop the service and back up $DATA/share before installing $target"
-      lock_data
-      require_idle_data
-      warn "back up $DATA/share before running OpenCode $target"
+      die "resolved tag $target is older than installed $current"
     fi
   fi
 
@@ -337,7 +330,6 @@ build_image() {
 update_openchamber() {
   openchamber_changed=no
   [ "$OPENCHAMBER" = yes ] || return 0
-  [ "${OPENCAVE_PIN:-0}" != 1 ] || return 0
   local current=$OPENCHAMBER_VERSION latest
   latest=$(curl --disable -fsSL --max-time 15 \
     'https://registry.npmjs.org/@openchamber%2Fweb/latest' 2>/dev/null |
