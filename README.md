@@ -6,9 +6,13 @@ with one project mounted, or run a persistent local server with an optional
 
 ## Install
 
-Use Linux with rootless Podman. Service mode also needs a systemd user session,
-`curl`, and a `podman compose` provider with profiles and
-`up --abort-on-container-exit` support.
+### Prerequisites
+
+- Fedora Workstation (tested on 44 & 45)
+- `podman`
+- `podman-compose`
+
+Service mode also needs a systemd user session and `curl`.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ernvk23/opencave/main/bootstrap.sh | bash
