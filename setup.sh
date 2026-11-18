@@ -309,6 +309,31 @@ build_image() {
   podman build --pull --build-arg "OPENCODE_TAG=$target" -t "$IMAGE" .
 }
 
+update_openchamber() {
+  openchamber_changed=no
+  [ "$OPENCHAMBER" = yes ] || return 0
+  [ "${OPENCAVE_PIN:-0}" != 1 ] || return 0
+  local current=$OPENCHAMBER_VERSION latest
+  latest=$(curl --disable -fsSL --max-time 15 \
+    'https://registry.npmjs.org/@openchamber%2Fweb/latest' 2>/dev/null |
+    sed -n 's/.*"version":"\([0-9][^"]*\)".*/\1/p') || latest=
+  if [ -z "$latest" ]; then
+    warn "could not resolve the OpenChamber version; keeping $current"
+    return 0
+  fi
+  case "$latest" in
+    *[!0-9.]*) warn "invalid OpenChamber version: $latest"; return 0 ;;
+  esac
+  if [ "$latest" = "$current" ] ||
+    [ "$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -n1)" != "$latest" ]; then
+    return 0
+  fi
+  OPENCHAMBER_VERSION=$latest
+  write_config
+  openchamber_changed=yes
+  printf 'OpenChamber updated to %s.\n' "$latest"
+}
+
 import_auth() {
   command -v opencode >/dev/null || { warn "host OpenCode is missing"; return 1; }
   if { [ "$service_active" = yes ] && opencode auth export | podman exec -i opencave opencode auth import; } ||
@@ -604,6 +629,7 @@ case "$cmd" in
   update)
     require_install
     build_image
+    update_openchamber
     if [ "$service_active" = yes ]; then
       require_service_deps
       setup_unit
@@ -611,6 +637,9 @@ case "$cmd" in
       built_image=$(podman image inspect --format '{{.Id}}' "$IMAGE")
       if [ "$unit_changed" = yes ] || [ "${current_image#sha256:}" != "${built_image#sha256:}" ]; then
         systemctl --user restart "$SERVICE"
+      elif [ "$openchamber_changed" = yes ]; then
+        compose --profile openchamber up -d --no-deps --no-build --force-recreate openchamber ||
+          warn "OpenChamber could not be updated; run opencave service-restart"
       fi
     fi
     exit ;;

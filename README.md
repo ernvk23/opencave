@@ -49,11 +49,12 @@ opencave uninstall           # prompts before removal
 Service mode mounts `~/opencave` by default. OpenCode listens at
 <http://127.0.0.1:4096/> with username `opencode`. If enabled, OpenChamber
 listens at <http://127.0.0.1:3000/> and uses a separate UI password. Its first
-launch downloads the pinned npm package. OpenChamber is pinned by
-`OPENCHAMBER_VERSION`; `opencave update` does not change it. Set a new version
-in `.env` and run `opencave service-restart`. Use `opencave service-status` and
-`opencave service-logs` for OpenCode, or `podman logs opencave-openchamber` for
-the UI.
+launch downloads the pinned npm package. `opencave update` also updates
+OpenChamber to the latest version when it is enabled; `OPENCAVE_PIN=1` keeps
+the pinned version. If the service is running, the UI container is recreated.
+Set `OPENCHAMBER_VERSION` in `.env` and run `opencave service-restart` to pin or
+change it manually. Use `opencave service-status` and `opencave service-logs`
+for OpenCode, or `podman logs opencave-openchamber` for the UI.
 
 In service mode, `opencave creds` prints the URLs and passwords. Setup,
 `service-start`, and `service-restart` also show them when their output goes to
@@ -152,9 +153,10 @@ Restart the service or start a new session to use the mount.
 
 ## Updating
 
-Setup and `opencave update` look for a stable OpenCode v2 release. If release
+Setup and `opencave update` look for a stable OpenCode v2 release. `update` also
+bumps OpenChamber to the latest npm version when it is enabled. If release
 lookup fails, first install uses the tag in the `Containerfile`. An existing
-installation keeps its image. To select the pinned tag deliberately, run
+installation keeps its image. To keep the pinned versions deliberately, run
 `OPENCAVE_PIN=1 opencave update`. Before downgrading, stop sessions and back up
 `DATA/share` because database migrations may be irreversible.
 
