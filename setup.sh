@@ -68,6 +68,31 @@ contains_path() {
   [[ "$2" == "$1" || "$2" == "${1%/}/"* ]]
 }
 
+is_home_subdirectory() {
+  [[ "$HOME_DIR" != / && "$1" == "$HOME_DIR/"* ]]
+}
+
+require_mount_paths() {
+  local path resolved
+  for path in "$@"; do
+    resolved=$(absolute_path "$path")
+    is_home_subdirectory "$resolved" ||
+      die "refusing to mount $path: it must resolve to a directory below $HOME_DIR"
+  done
+}
+
+require_data_mounts() {
+  require_mount_paths "$DATA" "$DATA"/{share,state,bin,cache,config,agents}
+}
+
+require_service_mounts() {
+  require_data_mounts
+  require_mount_paths "$WORKSPACE" "$DATA/openchamber/config/chats"
+  if [ "$OPENCHAMBER" = yes ]; then
+    require_mount_paths "$DATA/openchamber/config" "$DATA/openchamber/npm"
+  fi
+}
+
 load_config() {
   WORKSPACE=$HOME/opencave
   DATA=${XDG_DATA_HOME:-$HOME/.local/share}/opencave/data
@@ -335,6 +360,7 @@ update_openchamber() {
 }
 
 import_auth() {
+  require_mount_paths "$DATA" "$DATA/share"
   command -v opencode >/dev/null || { warn "host OpenCode is missing"; return 1; }
   if { [ "$service_active" = yes ] && opencode auth export | podman exec -i opencave opencode auth import; } ||
     opencode auth export | podman run --rm -i --entrypoint opencode \
@@ -461,12 +487,18 @@ uninstall() {
     rm -f -- "$CLI"
   fi
   rm -f -- "$ENV_FILE"
-  if [ -d "$WORKSPACE" ] && command -v restorecon >/dev/null; then
-    if contains_path "$WORKSPACE" "$(realpath -m -- "$HOME")"; then
-      warn "restore SELinux labels manually for this workspace: $WORKSPACE"
-    else
-      restorecon -R -F "$WORKSPACE" || warn "could not restore SELinux labels on $WORKSPACE"
+  if command -v restorecon >/dev/null; then
+    if [ -d "$WORKSPACE" ]; then
+      if is_home_subdirectory "$WORKSPACE"; then
+        restorecon -R -F "$WORKSPACE" || warn "could not restore SELinux labels on $WORKSPACE"
+      else
+        warn "restore SELinux labels manually for this workspace: $WORKSPACE"
+      fi
     fi
+    printf '%s\n' \
+      'Other project folders opened with OpenCave keep their SELinux labels.' \
+      'If you want to reset a project folder to policy defaults, close any containers still using it' \
+      'and run restorecon -R -F <project-folder>.'
   fi
   printf 'OpenCave uninstalled.\n'
 }
@@ -475,6 +507,7 @@ open_session() {
   require_install
   local mode=$1 dir name workdir=/root
   shift
+  require_data_mounts
   local mounts=(
     -v "$DATA/share:/root/.local/share/opencode:z"
     -v "$DATA/state:/root/.local/state/opencode:z"
@@ -491,9 +524,7 @@ open_session() {
     [ "$#" -le 1 ] || die "usage: opencave [DIR]"
     dir=$(absolute_path "${1:-$CALL_DIR}")
     [ -d "$dir" ] || die "not a directory: $dir"
-    if contains_path "$dir" "$(realpath -m -- "$HOME")"; then
-      die "refusing to mount $dir: it contains your home directory"
-    fi
+    require_mount_paths "$dir"
     name=${dir##*/}
     workdir=/workspace/${name:-workspace}
     mounts=( -v "$dir:$workdir:z" "${mounts[@]}" )
@@ -526,6 +557,7 @@ case "$cmd" in
   *) cmd=session ;;
 esac
 [ "$EUID" -ne 0 ] || die "run OpenCave as your regular user"
+HOME_DIR=$(absolute_path "$HOME")
 
 # Serialize configuration and service changes. The unit's callbacks run
 # while systemctl is waiting, so they don't acquire this lock.
@@ -565,12 +597,14 @@ case "$cmd" in
   session|shell) open_session "$cmd" "$@"; exit ;;
   --service-up)
     require_install
+    require_service_mounts
     compose up --no-build --abort-on-container-exit opencave
     exit ;;
   --service-ready)
     require_install
     wait_for_http
     if [ "$OPENCHAMBER" = yes ]; then
+      require_service_mounts
       if [ -z "$OPENCHAMBER_UI_PASSWORD" ]; then
         warn "set an OpenChamber password with 'opencave reconfigure'"
       elif ! compose --profile openchamber up -d --no-deps --no-build openchamber; then
@@ -621,6 +655,7 @@ case "$cmd" in
   version) require_install; image_version; exit ;;
   service-restart)
     require_service
+    require_service_mounts
     require_service_deps
     setup_unit
     systemctl --user restart "$SERVICE"
@@ -628,6 +663,7 @@ case "$cmd" in
     exit ;;
   update)
     require_install
+    if [ "$service_active" = yes ]; then require_service_mounts; fi
     build_image
     update_openchamber
     if [ "$service_active" = yes ]; then
@@ -675,6 +711,7 @@ WORKSPACE=$(absolute_path "${workspace_flag:-$WORKSPACE}")
 PORT=${port_flag:-$PORT}
 
 if [ "$mode" = service ]; then
+  require_service_mounts
   require_service_deps
   validate_port "$PORT"
   if [ "$OPENCHAMBER" = yes ]; then
@@ -684,11 +721,12 @@ if [ "$mode" = service ]; then
   if { [ "$first_install" = yes ] || [ "$cmd" = reconfigure ] || [ "$cmd" = service-start ]; } && port_busy "$PORT"; then
     die "port $PORT is already in use; pass --port to choose another"
   fi
+else
+  require_data_mounts
 fi
 
-if contains_path "$DATA" "$WORKSPACE" || contains_path "$DATA" "$SCRIPT_DIR" ||
-  contains_path "$DATA" "$(realpath -m -- "$HOME")"; then
-  die "DATA must not contain the workspace, checkout, or home directory"
+if contains_path "$DATA" "$WORKSPACE" || contains_path "$DATA" "$SCRIPT_DIR"; then
+  die "DATA must not contain the workspace or checkout"
 fi
 if [ -e "$CLI" ] || [ -L "$CLI" ]; then
   [ -L "$CLI" ] && [ "$(readlink -f -- "$CLI")" = "$SCRIPT_DIR/setup.sh" ] ||

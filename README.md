@@ -70,7 +70,8 @@ changing it.
 On-demand sessions mount the folder you select. Service mode mounts the
 configured workspace. Both use a writable mount at `/workspace/<folder>` and
 share OpenCave's data directory, which defaults to
-`~/.local/share/opencave/data` or `$XDG_DATA_HOME/opencave/data`.
+`~/.local/share/opencave/data` or `$XDG_DATA_HOME/opencave/data` when the
+resulting path is under your home directory.
 
 | Under `DATA` | What persists |
 | --- | --- |
@@ -90,9 +91,14 @@ edit the `Containerfile` and run `opencave update`.
 
 The containers run rootless and keep separate configuration from host OpenCode.
 An agent can modify its mounted workspace and access the shared OpenCave data.
-Choose folders accordingly, especially on SELinux systems where Podman
-relabels bind mounts. OpenCave refuses to mount a directory that contains your
-home directory.
+OpenCave's built-in project, workspace, and data mounts must resolve to
+subdirectories of your home directory. OpenCave rejects `~` itself and paths
+outside it, including symlinks to directories on drives mounted outside
+`~`.
+
+On SELinux systems, OpenCave uses Podman's `:z` option to apply shared labels
+to mounted directories. Closing a TUI session leaves those labels in place
+so other sessions can keep using the same folders.
 
 `opencave uninstall` closes OpenCave sessions and removes the CLI link,
 service, settings, and any data directory marked as belonging to that
@@ -100,9 +106,10 @@ checkout. The workspace, image, checkout, and unmarked data from older
 installs are kept. Back up `.env`, `DATA/share`, `DATA/config`, and
 `DATA/agents` if you plan to reuse them.
 Pass `--yes` for unattended uninstall.
-On SELinux systems, uninstall attempts to restore the configured workspace's
-labels. For other mounted folders, use `restorecon -R -F <folder>` after
-closing sessions that use them.
+On SELinux systems, uninstall attempts to reset the configured workspace to
+policy-default labels if it is below your home directory. If you want to reset
+another project folder you opened with OpenCave to policy defaults, close any
+containers still using it and run `restorecon -R -F <project-folder>`.
 
 ## MCPs
 
