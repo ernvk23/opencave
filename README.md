@@ -8,13 +8,13 @@ local server with the optional [OpenChamber](https://openchamber.dev/) web UI.
 Fedora / RHEL:
 
 ```sh
-sudo dnf install podman git curl util-linux
+sudo dnf install podman curl util-linux tar
 ```
 
 Debian / Ubuntu:
 
 ```sh
-sudo apt install podman uidmap curl git util-linux
+sudo apt install podman uidmap curl util-linux tar
 ```
 
 Server mode needs [podman-compose 1.3+](https://github.com/containers/podman-compose)
@@ -26,7 +26,7 @@ Then run:
 curl -fsSL https://raw.githubusercontent.com/ernvk23/opencave/main/bootstrap.sh | bash
 ```
 
-Or clone and run `./setup.sh`. Add `~/.local/bin` to `PATH` if needed.
+Or run `./setup.sh` from a local copy. Add `~/.local/bin` to `PATH` if needed.
 
 Rootless Podman only; Docker Engine is not supported. Tested on Fedora 44/45;
 Debian, Ubuntu, and RHEL need end-to-end testing.
@@ -82,9 +82,9 @@ installed checkout's mode-0600 `.env`.
   and offers to copy missing skills. To import later, stop the server and close
   sessions, then run `opencave import-auth` or `opencave import-skills [DIR]`.
   Only import trusted skills; confirmed overwrites have no backup.
-- **Update:** `opencave update` checks OpenCode and OpenChamber versions,
-  rebuilds the image, and restarts a running server if needed.
-  `--no-cache` also refreshes Alpine packages in the image.
+- **Update:** `opencave update` bumps versions, rebuilds the image, and restarts
+  a running server. The one-liner refreshes the scripts. `--no-cache` also
+  refreshes Alpine packages in the image.
 
 ## Uninstall
 

@@ -6,21 +6,26 @@ if [ "$EUID" -eq 0 ]; then
   printf '%s\n' 'error: run OpenCave as your regular user' >&2
   exit 1
 fi
-for tool in git curl podman flock; do
+for tool in curl tar podman flock; do
   if ! command -v "$tool" >/dev/null; then
     printf 'error: install %s before running the OpenCave bootstrap\n' "$tool" >&2
     exit 1
   fi
 done
 
-repo=${OPENCAVE_REPO_URL:-https://github.com/ernvk23/opencave.git}
+archive=${OPENCAVE_ARCHIVE_URL:-https://github.com/ernvk23/opencave/archive/refs/heads/main.tar.gz}
 src=${OPENCAVE_SRC:-$HOME/.local/share/opencave/src}
 
-if [ -d "$src/.git" ]; then
-  git -C "$src" pull --ff-only
-else
-  mkdir -p "$(dirname "$src")"
-  git clone "$repo" "$src"
+mkdir -p "$src"
+tmp=$(mktemp) || exit 1
+trap 'rm -f -- "$tmp"' EXIT
+if ! curl -fsSL --max-time 60 "$archive" -o "$tmp"; then
+  printf 'error: could not download %s\n' "$archive" >&2
+  exit 1
+fi
+if ! tar -xzf "$tmp" -C "$src" --strip-components=1; then
+  printf 'error: could not extract OpenCave into %s\n' "$src" >&2
+  exit 1
 fi
 
 # setup.sh prompts only on a TTY; a curl pipe is not one.
