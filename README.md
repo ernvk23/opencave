@@ -3,7 +3,9 @@
 Run [OpenCode](https://opencode.ai/) in rootless Podman: a terminal TUI, or a
 local server with the optional [OpenChamber](https://openchamber.dev/) web UI.
 
-## Install
+## Prerequisites
+
+Local rootless Podman, `curl`, `tar`, and `flock` (`util-linux`).
 
 Fedora / RHEL:
 
@@ -20,7 +22,7 @@ sudo apt install podman uidmap curl util-linux tar
 Server mode needs [podman-compose 1.3+](https://github.com/containers/podman-compose)
 (RHEL: EPEL) or Docker Compose v2 with the Podman user socket.
 
-Then run:
+## Install
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ernvk23/opencave/main/bootstrap.sh | bash
