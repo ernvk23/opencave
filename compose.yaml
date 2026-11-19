@@ -8,7 +8,7 @@ services:
     environment:
       OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:?set it in .env}
     volumes:
-      - "${WORKSPACE}:/workspace/${WORKSPACE_NAME:-workspace}:z"
+      - "${WORKSPACE}:/workspace/${WORKSPACE_NAME:-workspace}:${WORKSPACE_MOUNT_MODE:-rw}"
       - "${DATA}/share:/root/.local/share/opencode:z"
       - "${DATA}/bin:/root/.local/bin:z"
       - "${DATA}/cache:/root/.cache:z"
@@ -18,6 +18,7 @@ services:
       - "${DATA}/openchamber/config/chats:/root/.config/openchamber/chats:z"
     working_dir: /workspace/${WORKSPACE_NAME:-workspace}
     security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
 
   openchamber:
     profiles: ["openchamber"]
@@ -32,7 +33,7 @@ services:
       OPENCHAMBER_UI_PASSWORD: ${OPENCHAMBER_UI_PASSWORD:-}
       OPENCHAMBER_HOST: 0.0.0.0
     volumes:
-      - "${WORKSPACE}:/workspace/${WORKSPACE_NAME:-workspace}:z"
+      - "${WORKSPACE}:/workspace/${WORKSPACE_NAME:-workspace}"
       - "${DATA}/openchamber/config:/root/.config/openchamber:z"
       - "${DATA}/openchamber/npm:/root/.npm:z"
     working_dir: /workspace/${WORKSPACE_NAME:-workspace}
