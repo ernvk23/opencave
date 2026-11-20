@@ -441,8 +441,6 @@ skill_copy_hint() {
 }
 
 import_skills() (
-  local mode=$1
-  shift
   case "${1:-}" in -h|--help) printf '%s\n' 'Usage: opencave import-skills [DIR]'; exit ;; esac
   [ "$#" -le 1 ] || die "usage: opencave import-skills [DIR]"
   require_install
@@ -469,10 +467,9 @@ import_skills() (
   done
   mapfile -d '' -t skills < <(for source in "${sources[@]}"; do skill_paths "$source"; done)
   if [ "${#skills[@]}" -eq 0 ]; then
-    if [ "$mode" != setup ]; then printf 'No host skills found.\n'; fi
+    printf 'No host skills found.\n'
     exit 0
   fi
-  if [ "$mode" = setup ] && ! ask_yes "Copy missing global skills from the host?" no; then exit 0; fi
   require_rootfs
   lock_data
   require_idle_data
@@ -494,7 +491,7 @@ import_skills() (
     [ -z "${seen[$id]:-}" ] || continue
     unsafe=$(find "$skill" ! -type f ! -type d -print -quit) || die "could not inspect $skill"
     if [ -n "$unsafe" ]; then
-      if [ "$mode" = manual ]; then printf 'Skipped %q: linked or special file %q\n' "$id" "$unsafe"; fi
+      printf 'Skipped %q: linked or special file %q\n' "$id" "$unsafe"
       ((skipped += 1))
       continue
     fi
@@ -505,15 +502,13 @@ import_skills() (
     if [[ "$old" == "$target/"* && "${old##*/}" == "${skill##*/}" ]]; then out=$old; fi
     if [ "${ambiguous[$id]:-}" = yes ] || [ -n "${planned[$out]:-}" ] ||
       { [ "$out" != "$old" ] && { [ -e "$out" ] || [ -L "$out" ]; }; }; then
-      if [ "$mode" = manual ]; then
-        printf 'Skipped %q: destination %q is ambiguous or occupied (existing %q)\n' "$skill" "$out" "${old:--}"
-      fi
+      printf 'Skipped %q: destination %q is ambiguous or occupied (existing %q)\n' "$skill" "$out" "${old:--}"
       ((skipped += 1))
       continue
     fi
     if [ -n "$old" ]; then
       printf 'Conflict %q: incoming %q; existing %q\n' "$id" "$skill" "$old"
-      if [ "$mode" = manual ]; then has_conflicts=yes; fi
+      has_conflicts=yes
     fi
     pending+=("$id")
     destinations["$id"]=$out
@@ -553,7 +548,7 @@ import_skills() (
     ((imported += 1))
   done
   printf 'Imported %s skill(s); skipped %s.\n' "$imported" "$skipped"
-  if [ "$mode" = manual ] && [ "$skipped" -gt 0 ]; then skill_copy_hint "$target"; fi
+  if [ "$skipped" -gt 0 ]; then skill_copy_hint "$target"; fi
 )
 
 validate_port() {
@@ -1045,15 +1040,14 @@ reset() {
   [ -t 0 ] || die "opencave reset needs a terminal for confirmation"
   require_owned_data
   printf 'Reset deletes chats, settings, skills, and the internal Linux filesystem.\n'
-  printf 'Provider logins and project files are kept. You can import host skills afterward.\n'
+  printf 'Provider logins and project files are kept.\n'
   if ! ask_yes "Reset OpenCave?" no; then
     printf 'Cancelled.\n'
     return 0
   fi
   require_rootfs
   replace_rootfs reset
-  printf 'OpenCave reset complete.\n'
-  import_skills setup || warn "skill import did not finish. Retry with opencave import-skills."
+  printf 'OpenCave reset complete. Run '\''opencave help'\'' to see available commands.\n'
 }
 
 uninstall() {
@@ -1213,7 +1207,7 @@ case "$cmd" in
     require_install
     import_auth
     exit ;;
-  import-skills) import_skills manual "$@"; exit ;;
+  import-skills) import_skills "$@"; exit ;;
   serve) serve "$@"; exit ;;
   serve-restart) serve_restart "$@"; exit ;;
   serve-stop) serve_stop "$@"; exit ;;
@@ -1309,3 +1303,4 @@ if ! command -v opencave >/dev/null; then
     printf 'Add ~/.local/bin to PATH in your shell startup file, then open a new terminal.\n'
   fi
 fi
+printf 'Run '\''opencave help'\'' to see available commands.\n'
