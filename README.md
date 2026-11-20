@@ -1,6 +1,6 @@
 # OpenCave
 
-A convenient rootless container for OpenCode. Agent access is scoped to the folder you mount, keeping the rest of your machine out of reach. Optional OpenChamber web UI.
+A convenient rootless container for [OpenCode](https://opencode.ai). Agent access is scoped to the mounted folder, keeping the rest of the machine out of reach. Optional [OpenChamber](https://openchamber.dev) web UI.
 
 ## Prerequisites
 
@@ -19,7 +19,7 @@ curl -fL --progress-bar https://raw.githubusercontent.com/ernvk23/opencave/main/
 
 Or run `./setup.sh` from a checkout.
 
-## Commands
+## Usage
 
 ```sh
 opencave [DIR]                   # OpenCode in a project
@@ -32,7 +32,14 @@ opencave help                    # List commands
 opencave update                  # Update OpenCode and OpenChamber
 opencave update --system         # Also upgrade Alpine packages in OpenCave
 opencave reset                   # Clear chats and packages, keep provider logins
-opencave uninstall               # Remove OpenCave
 ```
+
+## Uninstall
+
+```sh
+opencave uninstall
+```
+
+Removes its containers, images, CLI, and local data. Mounted project folders are never touched.
 
 [MIT license](LICENSE)
