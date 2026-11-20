@@ -892,15 +892,7 @@ serve() {
   PORT=${port:-$PORT}
   validate_port "$PORT"
 
-  if [ -n "$openchamber" ]; then
-    OPENCHAMBER=$openchamber
-  elif [ -t 0 ]; then
-    if ask_yes "Start the OpenChamber web UI on 127.0.0.1:$OPENCHAMBER_PORT?" "$OPENCHAMBER"; then
-      OPENCHAMBER=yes
-    else
-      OPENCHAMBER=no
-    fi
-  fi
+  [ -z "$openchamber" ] || OPENCHAMBER=$openchamber
   if [ "$OPENCHAMBER" = yes ]; then
     validate_port "$OPENCHAMBER_PORT"
     [ "$OPENCHAMBER_PORT" != "$PORT" ] || die "OpenCode and OpenChamber need different host ports"
