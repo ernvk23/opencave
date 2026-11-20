@@ -1,6 +1,6 @@
 # OpenCave
 
-Run OpenCode in rootless Podman, with optional OpenChamber web access.
+A convenient rootless container for OpenCode. Agent access is scoped to the folder you mount, keeping the rest of your machine out of reach. Optional OpenChamber web UI.
 
 ## Prerequisites
 
