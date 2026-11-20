@@ -1293,9 +1293,6 @@ if [ "$first_install" = yes ] && [ "$import_first" = yes ] && command -v opencod
   import_auth || true
 fi
 write_config
-if [ "$first_install" = yes ] && [ -t 0 ]; then
-  import_skills setup || warn "skill import did not finish; retry with 'opencave import-skills'"
-fi
 if [ ! -L "$CLI" ]; then
   mkdir -p -- "$(dirname -- "$CLI")"
   ln -s -- "$SCRIPT_DIR/setup.sh" "$CLI"
