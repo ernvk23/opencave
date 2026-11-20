@@ -50,8 +50,8 @@ opencave creds              Show saved server URLs and passwords
 opencave import-auth        Import saved credentials from host OpenCode
 opencave import-skills [DIR] Copy global skills and preview conflicts
 opencave update             Update OpenCode and OpenChamber versions
-opencave update --system    Also upgrade Alpine packages
-opencave reset              Start over and keep provider logins
+opencave update --system    Also upgrade Alpine packages in OpenCave
+opencave reset              Clear chats and packages, keep provider logins
 opencave version            Show the installed OpenCode version
 opencave uninstall [--yes] [--keep-labels]
 HELP
@@ -1311,5 +1311,21 @@ if [ ! -L "$CLI" ]; then
 fi
 printf 'OpenCave is ready.\n'
 if ! command -v opencave >/dev/null; then
-  printf '%s\n' 'Run this in your current shell to use opencave:' '  export PATH="$HOME/.local/bin:$PATH"'
+  IFS= read -r caller_shell 2>/dev/null < "/proc/$PPID/comm" || caller_shell=
+  case "$caller_shell" in
+    bash|zsh) ;;
+    *) caller_shell=${SHELL:-}; caller_shell=${caller_shell##*/} ;;
+  esac
+  case "$caller_shell" in
+    bash) shell_rc='~/.bashrc' ;;
+    zsh) shell_rc='"${ZDOTDIR:-$HOME}/.zshrc"' ;;
+    *) shell_rc= ;;
+  esac
+  printf '~/.local/bin is missing from PATH.\n'
+  if [ -n "$shell_rc" ]; then
+    printf 'Run this once, then open a new terminal:\n  %s >> %s\n' \
+      "printf '\n%s\n' 'export PATH=\"\$HOME/.local/bin:\$PATH\"'" "$shell_rc"
+  else
+    printf 'Add ~/.local/bin to PATH in your shell startup file, then open a new terminal.\n'
+  fi
 fi

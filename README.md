@@ -1,14 +1,13 @@
 # OpenCave
 
-Run [OpenCode](https://opencode.ai/) in rootless Podman, with optional
-[OpenChamber](https://openchamber.dev/) web access.
+Run OpenCode in rootless Podman, with optional OpenChamber web access.
 
 ## Prerequisites
 
 ```sh
 # Fedora / RHEL
 sudo dnf install podman curl util-linux tar
-# Debian / Ubuntu
+# Ubuntu / Debian
 sudo apt install podman uidmap curl util-linux tar
 ```
 
@@ -18,38 +17,21 @@ sudo apt install podman uidmap curl util-linux tar
 curl -fL --progress-bar https://raw.githubusercontent.com/ernvk23/opencave/main/bootstrap.sh | bash
 ```
 
-From a local checkout, run `./setup.sh`.
+Or run `./setup.sh` from a checkout.
 
-**Note** If `~/.local/bin` is missing from `PATH`, run once and reopen your terminal. Use `~/.zshrc` for Zsh.
-
-```sh
-printf '\n%s\n' 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-```
-
-## Run
+## Commands
 
 ```sh
-opencave [DIR]               # TUI, defaults to the current folder
-opencave shell               # Bash in OpenCave
-opencave serve [DIR]         # OpenCode at http://127.0.0.1:4096
-opencave serve --openchamber # Add the web UI at http://127.0.0.1:3000
-opencave serve-stop
-opencave creds               # Show server URLs and credentials
-opencave help                # List all commands
+opencave [DIR]                   # OpenCode in a project
+opencave shell                   # Open a shell
+opencave serve [DIR]             # Start the server
+opencave serve --openchamber     # Include the web UI
+opencave help                    # List commands
+
+opencave update                  # Update OpenCode and OpenChamber
+opencave update --system         # Also upgrade Alpine packages in OpenCave
+opencave reset                   # Clear chats and packages, keep provider logins
+opencave uninstall               # Remove OpenCave
 ```
-
-OpenCave sessions share an internal Linux filesystem. The selected project is
-the writable host directory.
-
-## Maintenance
-
-Stop the server and close other sessions before updating or resetting.
-
-- `opencave update` updates OpenCode and OpenChamber. Keeps your data untouched.
-- `opencave update --system` also upgrades Alpine packages inside OpenCave.
-- `opencave reset` clears chats, settings, and installed packages. It keeps
-  provider logins and offers to import host skills again.
-- `opencave uninstall` removes OpenCave’s CLI, data, images, and bootstrap
-  source, and restores the SELinux labels it changed.
 
 [MIT license](LICENSE)
