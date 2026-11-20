@@ -26,6 +26,7 @@ opencave [DIR]                   # OpenCode in a project
 opencave shell                   # Open a shell
 opencave serve [DIR]             # Start the server
 opencave serve --openchamber     # Include the web UI
+opencave import-skills [DIR]     # Import host skills
 opencave help                    # List commands
 
 opencave update                  # Update OpenCode and OpenChamber

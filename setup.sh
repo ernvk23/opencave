@@ -304,7 +304,6 @@ image_version() {
 pull_opencode_image() {
   local base=$BASE_IMAGE:$OPENCODE_TAG before pulled
   before=$(podman image ls --all --quiet --no-trunc) || die "could not list local images"
-  printf 'Pulling OpenCode %s…\n' "$OPENCODE_TAG"
   podman pull "$base" || die "could not pull $base"
   pulled=$(podman image inspect --format '{{.Id}}' "$base") ||
     die "could not identify the base image for $base"
@@ -1004,14 +1003,6 @@ update_command() {
   require_rootfs
   if server_containers; then die "run opencave serve-stop before updating"; fi
   require_idle_data
-  [ -t 0 ] || die "opencave update needs a terminal for confirmation"
-  printf 'Updates OpenCode and OpenChamber versions. Keeps your data untouched.\n'
-  if [ "$update_system" = yes ]; then printf 'Also upgrades Alpine packages in OpenCave.\n'; fi
-  if ! ask_yes "Update OpenCave?" no; then
-    printf 'Cancelled.\n'
-    return 0
-  fi
-
   printf 'Checking for releases…\n'
   resolve_versions
   lock_data
@@ -1034,7 +1025,7 @@ update_command() {
   if [ "$OPENCHAMBER_VERSION" = "$chamber_before" ]; then
     printf 'OpenChamber has no newer release (%s).\n' "$OPENCHAMBER_VERSION"
   else
-    printf 'OpenChamber will use %s the next time it starts.\n' "$OPENCHAMBER_VERSION"
+    printf 'OpenChamber updated to %s. It will download on next start.\n' "$OPENCHAMBER_VERSION"
   fi
   if ! remove_owned_images "$IMAGE" "$BASE_IMAGE:$OPENCODE_TAG"; then
     warn "Some old images remain. Cleanup will retry on the next update or uninstall."
@@ -1323,8 +1314,8 @@ if ! command -v opencave >/dev/null; then
   esac
   printf '~/.local/bin is missing from PATH.\n'
   if [ -n "$shell_rc" ]; then
-    printf 'Run this once, then open a new terminal:\n  %s >> %s\n' \
-      "printf '\n%s\n' 'export PATH=\"\$HOME/.local/bin:\$PATH\"'" "$shell_rc"
+    printf 'Run this once, then open a new terminal:\n'
+    printf '  printf "\\n%%s\\n" '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> %s\n' "$shell_rc"
   else
     printf 'Add ~/.local/bin to PATH in your shell startup file, then open a new terminal.\n'
   fi
