@@ -6,11 +6,27 @@ SCRIPT_DIR=$(dirname -- "$(readlink -f -- "$0")")
 cd "$SCRIPT_DIR"
 
 ENV_FILE=$SCRIPT_DIR/.env
+BASE_IMAGES_FILE=$ENV_FILE.base-images
 IMAGE=localhost/opencave:latest
+BASE_IMAGE=ghcr.io/anomalyco/opencode
+IMAGE_OWNER=io.opencave.checkout
+CONTAINER_OWNER='{{.Label "io.opencave.checkout"}}'
 CLI=$HOME/.local/bin/opencave
+ROOTFS_PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ROOTFS_OPTIONS=(--security-opt no-new-privileges:true --tmpfs /tmp:exec,nodev,nosuid)
 
-die() { printf 'error: %s\n' "$*" >&2; exit 1; }
-warn() { printf 'warning: %s\n' "$*" >&2; }
+diagnostic() {
+  local level=$1 color=$2
+  shift 2
+  if [ -t 2 ]; then
+    printf '\033[%sm%s:\033[0m %s\n' "$color" "$level" "$*"
+  else
+    printf '%s: %s\n' "$level" "$*"
+  fi >&2
+}
+
+die() { diagnostic error 31 "$@"; exit 1; }
+warn() { diagnostic warning 33 "$@"; }
 
 usage() {
   if [ "${1:-}" = setup ]; then
@@ -33,10 +49,12 @@ opencave creds              Show saved server URLs and passwords
 
 opencave import-auth        Import saved credentials from host OpenCode
 opencave import-skills [DIR] Copy global skills and preview conflicts
-opencave update              Update versions and rebuild the image
-opencave update --no-cache   Also force an Alpine package refresh
+opencave --update           Update versions and rebuild the image
+opencave --update --no-cache
+                            Also force an Alpine package refresh
+opencave --reset            Start over and keep provider logins
 opencave version            Show the installed image's OpenCode version
-opencave uninstall [--yes]
+opencave --uninstall [--yes] [--keep-labels]
 HELP
 }
 
@@ -85,7 +103,8 @@ require_mount_paths() {
 }
 
 require_data_mounts() {
-  require_mount_paths "$DATA" "$DATA"/{share,state,bin,cache,config,agents}
+  require_mount_paths "$DATA" "$ROOTFS"
+  [ ! -L "$ROOTFS" ] || die "the shared filesystem must not be a symlink: $ROOTFS"
 }
 
 require_project_mount() {
@@ -138,15 +157,6 @@ require_install() {
   [ -f "$ENV_FILE" ] || die "run ./setup.sh first"
 }
 
-compose() (
-  WORKSPACE_NAME=${WORKSPACE##*/}
-  WORKSPACE_NAME=${WORKSPACE_NAME:-workspace}
-  export WORKSPACE WORKSPACE_NAME WORKSPACE_MOUNT_MODE DATA PORT BIND_ADDR OPENCODE_SERVER_PASSWORD
-  export OPENCHAMBER_VERSION OPENCHAMBER_PORT OPENCHAMBER_UI_PASSWORD
-  # Use the same literal values as on-demand mode, regardless of provider.
-  podman compose -f compose.yaml --env-file /dev/null "$@"
-)
-
 server_url() {
   local address=$BIND_ADDR
   case "$address" in
@@ -188,10 +198,7 @@ print_status() {
   if [ "$OPENCHAMBER" = yes ] && openchamber_running; then
     printf 'OpenChamber: http://127.0.0.1:%s/\n' "$OPENCHAMBER_PORT"
     if [ "$show_passwords" = yes ]; then printf '  Password: %s\n' "$OPENCHAMBER_UI_PASSWORD"; fi
-  else
-    printf 'OpenChamber: off\n'
   fi
-  if [ "$show_passwords" = no ]; then printf 'Show passwords: opencave creds\n'; fi
 }
 
 require_rootless_podman() {
@@ -204,21 +211,14 @@ require_rootless_podman() {
     die "configure subordinate UID and GID ranges for your account; see the README"
 }
 
-require_compose() {
-  # The Docker Compose provider uses the Podman user socket.
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl --user start podman.socket >/dev/null 2>&1 || true
-  fi
-  compose --profile openchamber config >/dev/null ||
-    die "serve needs a compatible Compose provider (podman-compose 1.3+ or Docker Compose v2+); see the README"
-}
-
 server_running() {
-  [ -n "$(podman ps -q --filter 'name=^opencave$' --filter status=running 2>/dev/null)" ]
+  local name=${1:-opencave}
+  [ "$(podman ps --filter "name=^$name\$" --filter status=running \
+    --format "$CONTAINER_OWNER" 2>/dev/null)" = "$SCRIPT_DIR" ]
 }
 
 openchamber_running() {
-  [ -n "$(podman ps -q --filter 'name=^opencave-openchamber$' --filter status=running 2>/dev/null)" ]
+  server_running opencave-openchamber
 }
 
 server_containers() {
@@ -226,66 +226,141 @@ server_containers() {
 }
 
 stop_server() {
-  local containers entry
+  local containers entry name id
+  local -a ids=()
   containers=$(podman ps -a --filter 'name=^opencave(-openchamber)?$' \
-    --format '{{.ID}} {{.Label "com.docker.compose.project.working_dir"}}') ||
+    --format "{{.Names}} {{.ID}} $CONTAINER_OWNER") ||
     die "could not check for OpenCave containers"
   [ -n "$containers" ] || return 0
   while IFS= read -r entry; do
+    name=${entry%% *}
+    entry=${entry#* }
+    id=${entry%% *}
     [ "${entry#* }" = "$SCRIPT_DIR" ] ||
-      die "container ${entry%% *} does not belong to this OpenCave checkout"
+      die "container $name does not belong to this OpenCave checkout"
+    if [[ "$name" = *-openchamber ]]; then
+      ids=("$id" "${ids[@]}")
+    else
+      ids+=("$id")
+    fi
   done <<< "$containers"
-  [ -n "$WORKSPACE" ] || die "server workspace is missing from $ENV_FILE"
-  compose --profile openchamber down ||
-    die "could not stop the OpenCave server; check the Compose provider and retry"
+  for id in "${ids[@]}"; do
+    podman rm --force --ignore "$id" >/dev/null || die "could not stop container $id"
+  done
 }
 
-start_server() {
-  local WORKSPACE_MOUNT_MODE
+start_server() (
+  local mount_mode name=${WORKSPACE##*/} workdir bind=$BIND_ADDR
+  case "$bind" in
+    \[*\]) ;;
+    *:*) bind="[$bind]" ;;
+  esac
+  local -a ports=(-p "$bind:$PORT:4096")
+  export OPENCODE_SERVER_PASSWORD OPENCHAMBER_UI_PASSWORD
   command -v curl >/dev/null || die "install curl first"
-  require_data_mounts
   require_project_mount "$WORKSPACE"
-  [ -d "$DATA/share" ] || die "OpenCave data is missing; run ./setup.sh"
-  podman image exists "$IMAGE" || die "OpenCave image is missing; run ./setup.sh or opencave update"
-  WORKSPACE_MOUNT_MODE=$(project_mount_mode "$WORKSPACE") || exit 1
-  mkdir -p -- "$DATA/openchamber/config/chats" || die "could not create $DATA/openchamber/config/chats"
-  if [ "$OPENCHAMBER" = yes ]; then
-    require_mount_paths "$DATA/openchamber/config" "$DATA/openchamber/npm"
-    mkdir -p -- "$DATA/openchamber/config" "$DATA/openchamber/npm" ||
-      die "could not create the OpenChamber data directories"
+  require_rootfs
+  workdir=/workspace/${name:-workspace}
+  mount_mode=$(project_mount_mode "$WORKSPACE") || exit 1
+  if [ "$OPENCHAMBER" = yes ] && [ -n "$OPENCHAMBER_UI_PASSWORD" ]; then
+    ports+=(-p "127.0.0.1:$OPENCHAMBER_PORT:3000")
   fi
-  require_compose
-  compose up -d --no-build opencave || die "could not start the OpenCode container"
+  printf 'Starting OpenCode…\n'
+  podman run -d --name opencave --restart unless-stopped \
+    --label "$IMAGE_OWNER=$SCRIPT_DIR" \
+    "${ROOTFS_OPTIONS[@]}" "${ports[@]}" --env "PATH=$ROOTFS_PATH" \
+    --env OPENCODE_SERVER_PASSWORD \
+    -v "$WORKSPACE:$workdir:$mount_mode" -w "$workdir" --rootfs "$ROOTFS" \
+    opencode serve --hostname 0.0.0.0 --port 4096 8<&- 9<&- >/dev/null ||
+    die "could not start OpenCode"
   if ! wait_for_http; then
-    compose --profile openchamber down >/dev/null 2>&1 || true
+    stop_server
     return 1
   fi
   if [ "$OPENCHAMBER" = yes ]; then
     if [ -z "$OPENCHAMBER_UI_PASSWORD" ]; then
       warn "set an OpenChamber password with 'opencave serve'"
-    elif ! compose --profile openchamber up -d --no-deps --no-build openchamber; then
+    elif ! podman run -d --name opencave-openchamber --network container:opencave --restart unless-stopped \
+      --label "$IMAGE_OWNER=$SCRIPT_DIR" \
+      "${ROOTFS_OPTIONS[@]}" --env "PATH=$ROOTFS_PATH" \
+      --env OPENCODE_HOST=http://127.0.0.1:4096 --env OPENCODE_SKIP_START=true \
+      --env OPENCODE_SERVER_PASSWORD --env OPENCHAMBER_HOST=0.0.0.0 \
+      --env OPENCHAMBER_UI_PASSWORD \
+      -v "$WORKSPACE:$workdir:$mount_mode" -w "$workdir" --rootfs "$ROOTFS" \
+      npx --yes "@openchamber/web@$OPENCHAMBER_VERSION" --foreground --port 3000 8<&- 9<&- >/dev/null; then
       warn "OpenChamber could not start. OpenCode is available."
     fi
   fi
-  printf 'OpenCave is running.\n'
-  print_status "${1:-}"
-}
+  print_status passwords
+)
 
 image_version() {
-  podman run --rm --entrypoint opencode "$IMAGE" --version
+  require_rootfs
+  exec 8< "$DATA"
+  flock -sn 8 || die "OpenCave is busy. Retry after the current maintenance command finishes."
+  podman run --rm --network=none --label "$IMAGE_OWNER=$SCRIPT_DIR" \
+    "${ROOTFS_OPTIONS[@]}" --rootfs "$ROOTFS" opencode --version 8<&- 9<&-
 }
 
 build_image() {
-  local -a options=(--pull=always)
-  if [ "${1:-}" = --no-cache ]; then options+=(--no-cache); fi
-  podman build "${options[@]}" --build-arg "OPENCODE_TAG=$OPENCODE_TAG" -t "$IMAGE" . ||
-    die "could not build OpenCode $OPENCODE_TAG; set a known-good OPENCODE_TAG in $ENV_FILE and retry"
-  printf 'OpenCode image ready: %s.\n' "$OPENCODE_TAG"
+  local base=$BASE_IMAGE:$OPENCODE_TAG before pulled
+  local -a options=()
+  if [ "${1:-}" = --no-cache ]; then options=(--no-cache); fi
+
+  before=$(podman image ls --all --quiet --no-trunc) || die "could not list local images"
+  printf 'Pulling OpenCode %s…\n' "$OPENCODE_TAG"
+  podman pull "$base" || die "could not pull $base"
+  pulled=$(podman image inspect --format '{{.Id}}' "$base") ||
+    die "could not identify the base image for $base"
+  pulled=${pulled#sha256:}
+  [[ "$pulled" =~ ^[a-f0-9]{64}$ ]] || die "could not identify the base image for $base"
+  if ! grep -Fxq -e "$pulled" -e "sha256:$pulled" <<< "$before"; then
+    (umask 077; printf '%s %s\n' "$pulled" "$base" >> "$BASE_IMAGES_FILE")
+  fi
+
+  printf 'Building the OpenCave image…\n'
+  podman build --pull=never --force-rm --label "$IMAGE_OWNER=$SCRIPT_DIR" \
+    "${options[@]}" --build-arg "OPENCODE_TAG=$OPENCODE_TAG" -t "$IMAGE" . ||
+    die "could not build OpenCode $OPENCODE_TAG"
+}
+
+remove_owned_image() {
+  local id=$1 expected_tag=$2 keep_tag=$3 tags status
+  if podman image exists "$id"; then
+    tags=$(podman image inspect --format '{{join .RepoTags " "}}' "$id") || return 1
+  else
+    status=$?
+    [ "$status" -eq 1 ]
+    return
+  fi
+  if [ -n "$tags" ] && [ "$tags" != "$expected_tag" ]; then
+    printf 'Keeping image %s because it has other tags.\n' "${id:0:12}"
+    return 0
+  fi
+  [ -n "$keep_tag" ] && [ "$tags" = "$keep_tag" ] && return 0
+  podman image rm "$id"
+}
+
+remove_owned_images() {
+  local keep_image=${1:-} keep_base=${2:-} ids id tag pending=0
+  ids=$(podman image ls --all --quiet --no-trunc --filter "label=$IMAGE_OWNER=$SCRIPT_DIR") ||
+    return 1
+  for id in $ids; do
+    remove_owned_image "$id" "$IMAGE" "$keep_image" || pending=1
+  done
+  if [ -f "$BASE_IMAGES_FILE" ]; then
+    while read -r id tag; do
+      [[ "$id" =~ ^[a-f0-9]{64}$ && "$tag" == "$BASE_IMAGE":* ]] || continue
+      remove_owned_image "$id" "$tag" "$keep_base" || pending=1
+    done < "$BASE_IMAGES_FILE"
+  fi
+  return "$pending"
 }
 
 import_auth() {
-  require_mount_paths "$DATA" "$DATA/share"
   command -v opencode >/dev/null || { warn "host OpenCode is missing"; return 1; }
+  require_rootfs
+  printf 'Importing provider logins…\n'
   if server_running &&
     opencode auth export | podman exec -i opencave opencode auth import; then
     return 0
@@ -294,9 +369,8 @@ import_auth() {
   if (
     lock_data
     require_idle_data
-    opencode auth export | podman run --rm -i --security-opt no-new-privileges:true \
-      --entrypoint opencode -v "$DATA/share:/root/.local/share/opencode:z" \
-      "$IMAGE" --standalone auth import 8<&-
+    opencode auth export | podman run --rm -i --network=none "${ROOTFS_OPTIONS[@]}" \
+      --rootfs "$ROOTFS" opencode --standalone auth import 8<&- 9<&-
   ); then
     return 0
   fi
@@ -345,7 +419,8 @@ import_skills() (
   case "${1:-}" in -h|--help) printf '%s\n' 'Usage: opencave import-skills [DIR]'; exit ;; esac
   [ "$#" -le 1 ] || die "usage: opencave import-skills [DIR]"
   require_install
-  local root source target=$DATA/config/skills skill id old out unsafe answer
+  local root source target=$ROOTFS/root/.config/opencode/skills skill id old out unsafe answer
+  local agent_skills=$ROOTFS/root/.agents/skills
   local -a roots=("${XDG_CONFIG_HOME:-$HOME/.config}/opencode/skills" "$HOME/.agents/skills")
   local -a sources=() skills=() pending=()
   local imported=0 skipped=0 overwrite=no has_conflicts=no
@@ -371,13 +446,12 @@ import_skills() (
     exit 0
   fi
   if [ "$mode" = setup ] && ! ask_yes "Copy missing global skills from the host?" no; then exit 0; fi
-
-  require_data_mounts
-  [ -d "$DATA/share" ] && [ -d "$DATA/config" ] || die "OpenCave data is missing; run ./setup.sh"
+  require_rootfs
   lock_data
   require_idle_data
-  [ ! -L "$DATA/config" ] && [ ! -L "$target" ] &&
-    { [ ! -e "$target" ] || [ -d "$target" ]; } || die "not a regular skills directory: $target"
+  require_unmounted_path "$target"
+  require_unmounted_path "$agent_skills"
+  [ ! -e "$target" ] || [ -d "$target" ] || die "not a regular skills directory: $target"
 
   while IFS= read -r -d '' skill; do
     id=${skill##*/}
@@ -385,7 +459,7 @@ import_skills() (
     old=${existing[$id]:-}
     if [[ "$skill" == "$target/"* && "$old" == "$target/"* ]]; then ambiguous["$id"]=yes; fi
     existing["$id"]=$skill
-  done < <(skill_paths "$DATA/agents/skills"; skill_paths "$target")
+  done < <(skill_paths "$agent_skills"; skill_paths "$target")
 
   for skill in "${skills[@]}"; do
     id=${skill##*/}
@@ -472,7 +546,7 @@ password() {
 }
 
 prepare_data() {
-  local new=no config=$DATA/config/opencode.json
+  local new=no
   if [ ! -d "$DATA" ] || [ -z "$(find "$DATA" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
     new=yes
   elif [ "$first_install" = yes ] &&
@@ -484,43 +558,127 @@ prepare_data() {
     chmod 700 "$DATA"
     printf '%s\n' "$SCRIPT_DIR" > "$DATA/.opencave-owner"
   fi
-  mkdir -p -- "$DATA"/{share,state,bin,cache,config,agents}
-  if [ ! -L "$config" ] && [ ! -e "$config" ]; then
-    printf '%s\n' '{ "$schema": "https://opencode.ai/config.json" }' > "$config"
-  fi
 }
 
 lock_data() {
-  if [ -d "$DATA/share" ]; then
-    exec 8< "$DATA/share" || die "could not open $DATA/share to lock it"
-    flock -x -w "${1:-0}" 8 || die "OpenCave data is in use. Close any OpenCave sessions and retry."
+  if [ -d "$DATA" ]; then
+    exec 8< "$DATA" || die "could not open $DATA to lock it"
+    flock -x -w "${1:-0}" 8 || die "Close any other OpenCave sessions and retry."
   fi
 }
 
-require_idle_data() {
-  local containers container details
-  local -a sessions=()
-  # Containers started by older versions did not take the shared lock.
-  containers=$(podman ps --all --filter status=running --filter status=paused \
-    --filter volume=/root/.local/share/opencode --format '{{.ID}}') ||
-    die "could not check whether OpenCave data is in use"
-  for container in $containers; do
-    details=$(podman container inspect --format '{{.ImageName}}{{range .Mounts}}{{printf "\n%s:%s" .Source .Destination}}{{end}}' "$container") ||
-      die "could not verify whether container $container uses DATA"
-    if ! grep -Fxq -- "$DATA/share:/root/.local/share/opencode" <<< "$details"; then
-      continue
-    fi
-    if [ "${1:-}" = stop ] && [ "${details%%$'\n'*}" = "$IMAGE" ] &&
-      grep -Fxq -- "$DATA/config:/root/.config/opencode" <<< "$details"; then
-      sessions+=("$container")
-    else
-      die "OpenCave data is in use by container $container. Close it and retry."
-    fi
-  done
-  if [ "${#sessions[@]}" -gt 0 ]; then
-    printf 'Closing OpenCave sessions.\n'
-    podman rm --force --ignore --time 10 "${sessions[@]}" >/dev/null
+require_unmounted_path() {
+  local path=$1 mount
+  [ ! -L "$path" ] && [ "$(realpath -m -- "$path")" = "$path" ] ||
+    die "path must not be a symlink: $path"
+  mount=$(project_mountpoint "$path") || die "could not check mounts under $path"
+  [ -z "$mount" ] || die "path includes mountpoint $mount"
+}
+
+require_owned_data() {
+  [ ! -L "$DATA/.opencave-owner" ] && [ -f "$DATA/.opencave-owner" ] &&
+    [ "$(< "$DATA/.opencave-owner")" = "$SCRIPT_DIR" ] ||
+    die "this install does not own $DATA"
+}
+
+unpack_image() (
+  local destination=$1 seed
+  mkdir -p -- "$destination"
+  seed=$(podman create --pull=never "$IMAGE" 8<&- 9<&-) ||
+    die "OpenCave image is missing. Run ./setup.sh or opencave --update"
+  trap 'podman rm --force --ignore "$seed" >/dev/null' EXIT
+  podman export "$seed" 8<&- 9<&- |
+    podman unshare tar -xpf - -C "$destination" 8<&- 9<&-
+)
+
+copy_directory() {
+  local source=$1 destination=$2
+  require_unmounted_path "$source"
+  require_unmounted_path "$destination"
+  podman unshare rm -rf --one-file-system -- "$destination"
+  mkdir -p -- "$(dirname -- "$destination")"
+  podman unshare cp -aT -- "$source" "$destination"
+}
+
+restore_rootfs() {
+  if [ -d "$stage/old" ]; then
+    if [ -d "$ROOTFS" ]; then mv -T -- "$ROOTFS" "$stage/failed" || return 1; fi
+    mv -T -- "$stage/old" "$ROOTFS"
   fi
+}
+
+replace_rootfs() (
+  local mode=$1 stage path committed=no
+  require_owned_data
+  lock_data
+  if [ "$mode" = init ] && [ -d "$ROOTFS" ]; then return 0; fi
+  if server_containers; then die "run opencave serve-stop before replacing the shared filesystem"; fi
+  require_idle_data
+  require_unmounted_path "$ROOTFS"
+  if [ ! -d "$ROOTFS" ]; then
+    for path in "$DATA"/.rootfs.*/old; do
+      [ -d "$path" ] || continue
+      die "the previous filesystem is at $path. Move it back to $ROOTFS and retry"
+    done
+  fi
+
+  stage=$(mktemp -d "$DATA/.rootfs.XXXXXX")
+  trap 'if [ "$committed" = yes ] || restore_rootfs; then
+    podman unshare rm -rf --one-file-system -- "$stage" ||
+      warn "Could not remove working files at $stage"
+  else
+    warn "Previous filesystem remains at $stage/old"
+  fi' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  printf 'Preparing the shared filesystem…\n'
+  unpack_image "$stage/new"
+  if [ "$mode" = update ]; then
+    printf 'Copying your OpenCave home…\n'
+    copy_directory "$ROOTFS/root" "$stage/new/root"
+  fi
+
+  # The extracted filesystem needs the shared SELinux label.
+  if [ "$(podman_selinux)" = true ]; then
+    printf 'Labeling the shared filesystem for SELinux…\n'
+    podman unshare chcon -Rh -t container_file_t -l s0 -- "$stage/new"
+  fi
+
+  podman run --rm --network=none "${ROOTFS_OPTIONS[@]}" --rootfs "$stage/new" \
+    opencode --version >/dev/null 8<&- 9<&-
+
+  if [ "$mode" = reset ]; then
+    printf 'Preserving provider logins…\n'
+    if ! podman run --rm --network=none "${ROOTFS_OPTIONS[@]}" --rootfs "$ROOTFS" \
+      opencode --standalone auth export 2>/dev/null 8<&- 9<&- |
+      podman run --rm -i --network=none "${ROOTFS_OPTIONS[@]}" --rootfs "$stage/new" \
+        opencode --standalone auth import >/dev/null 2>&1 8<&- 9<&-; then
+      die "could not preserve provider logins. OpenCave data was kept"
+    fi
+  fi
+
+  if [ -d "$ROOTFS" ]; then mv -T -- "$ROOTFS" "$stage/old"; fi
+  mv -T -- "$stage/new" "$ROOTFS"
+  if [ "$mode" = reset ]; then reset_server_settings; fi
+  committed=yes
+)
+
+require_rootfs() {
+  require_data_mounts
+  require_owned_data
+  [ -d "$ROOTFS" ] || die "the shared filesystem is missing. Run ./setup.sh"
+}
+
+require_idle_data() {
+  local owned
+  local -a sessions=()
+  owned=$(podman ps -aq --filter status=running --filter status=paused \
+    --filter "label=$IMAGE_OWNER=$SCRIPT_DIR") || die "could not check active OpenCave containers"
+  [ -n "$owned" ] || return 0
+  [ "${1:-}" = stop ] || die "OpenCave is in use. Close its sessions and retry."
+  mapfile -t sessions <<< "$owned"
+  podman rm --force --ignore "${sessions[@]}" >/dev/null
 }
 
 podman_selinux() {
@@ -557,54 +715,79 @@ project_mount_mode() {
   case "$context" in
     *:object_r:container_file_t:s0) printf '%s\n' rw; return ;;
     *:object_r:container_file_t:*)
-      die "refusing private or custom SELinux label on $1; use: restorecon -RFvx $(printf '%q' "$1")" ;;
+      printf 'SELinux labels kept on %q. To preview a reset, run restorecon -nRFvx -- %q\n' "$1" "$1" >&2
+      return 1 ;;
   esac
   command -v restorecon >/dev/null || die "install policycoreutils to check SELinux project labels"
-  diagnostics=$(restorecon -nFv -- "$1" 2>&1) || die "could not check SELinux labels on $1: $diagnostics"
-  [ -z "$diagnostics" ] ||
-    die "refusing non-default SELinux label on $1: $diagnostics
-use: restorecon -RFvx $(printf '%q' "$1")"
   # Podman's relabel can cross mountpoints; our check and cleanup must not.
   mount=$(project_mountpoint "$1") || die "could not check mountpoints under $1"
   [ -z "$mount" ] || die "refusing to relabel $1: it includes mountpoint $mount"
   diagnostics=$(restorecon -nRFvxI -- "$1" 2>&1 | sed -n '1p') ||
     die "could not check SELinux labels under $1: $diagnostics"
-  [ -z "$diagnostics" ] ||
-    die "refusing non-default SELinux labels under $1: $diagnostics
-use: restorecon -RFvx $(printf '%q' "$1")"
+  if [ -n "$diagnostics" ]; then
+    printf 'SELinux labels kept under %q. To preview a reset, run restorecon -nRFvx -- %q\n' "$1" "$1" >&2
+    return 1
+  fi
   # Podman can relabel the project even if the container fails to start.
   record_labeled_project "$1" || die "could not record SELinux cleanup path: $1"
   printf '%s\n' z
 }
 
-reset_project_labels() {
-  local ledger=$DATA/.selinux-default-projects entry project identity ids mounts mount current busy diagnostics
-  local -A recorded=()
-  local -a containers=() active_mounts=()
+read_labeled_projects() {
+  local -n projects=$1
+  local ledger=$DATA/.selinux-default-projects entry project identity
   [ ! -L "$ledger" ] && [ -f "$ledger" ] || return 0
   while IFS= read -r entry; do
     project=${entry#*$'\t'}
     identity=${entry%%$'\t'*}
     if [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]] && is_home_subdirectory "$project"; then
-      recorded["$project"]=$identity
+      projects["$project"]=$identity
     fi
   done < "$ledger"
+}
+
+show_project_label_cleanup() {
+  local -A recorded=()
+  read_labeled_projects recorded || return 1
+  [ "${#recorded[@]}" -gt 0 ] || return 0
+  local -a projects=("${!recorded[@]}")
+  printf 'Projects recorded for SELinux cleanup:\n'
+  printf '  %q\n' "${projects[@]}"
+  [ "${1:-}" = manual ] || return 0
+  cat <<'HELP'
+To handle labels manually, stop containers using the folder and unmount any nested mounts.
+For each listed project, set project to its current path.
+HELP
+  printf '  project=%q\n' "${projects[0]}"
+  cat <<'HELP'
+  # Preview the label changes
+  find "$project" -xdev -context '*:object_r:container_file_t:s0' -print0 | restorecon -nFv -0 -f -
+  # Apply the changes after reviewing the preview
+  find "$project" -xdev -context '*:object_r:container_file_t:s0' -print0 | restorecon -Fv -0 -f -
+Then run opencave --uninstall --keep-labels after handling all listed folders.
+HELP
+}
+
+reset_project_labels() {
+  local ledger=$DATA/.selinux-default-projects project ids mounts mount current busy diagnostics
+  local -A recorded=()
+  local -a containers=() active_mounts=() pending=()
+  read_labeled_projects recorded || return 1
   [ "${#recorded[@]}" -gt 0 ] || return 0
 
-  printf 'Project folders recorded for SELinux cleanup:\n'
-  printf '  %q\n' "${!recorded[@]}"
   if ! command -v restorecon >/dev/null ||
     [ "$(podman_selinux)" != true ]; then
-    warn "cannot restore labels here: restorecon and local SELinux-enabled Podman are required"
-    return 0
+    printf 'SELinux cleanup needs restorecon and an SELinux-enabled host. Pending folders:\n' >&2
+    printf '  %q\n' "${!recorded[@]}" >&2
+    return 1
   fi
 
   ids=$(podman ps -q --all --filter status=running --filter status=paused) ||
-    { warn "could not check active Podman containers; restore labels manually"; return 0; }
+    { printf 'SELinux cleanup pending. Could not check active Podman containers.\n' >&2; return 1; }
   if [ -n "$ids" ]; then
     mapfile -t containers <<< "$ids"
     mounts=$(podman container inspect --format '{{range .Mounts}}{{println .Source}}{{end}}' "${containers[@]}") ||
-      { warn "could not check active Podman mounts; restore labels manually"; return 0; }
+      { printf 'SELinux cleanup pending. Could not check active Podman mounts.\n' >&2; return 1; }
     while IFS= read -r mount; do
       [[ "$mount" = /* ]] || continue
       current=$(realpath -e -- "$mount" 2>/dev/null) || current=$mount
@@ -616,7 +799,8 @@ reset_project_labels() {
     if [ ! -d "$project" ] || [ "$(realpath -e -- "$project" 2>/dev/null)" != "$project" ] ||
       [ "$(stat -Lc '%d:%i' -- "$project" 2>/dev/null)" != "${recorded[$project]}" ] ||
       paths_overlap "$project" "$DATA" || paths_overlap "$project" "$SCRIPT_DIR"; then
-      warn "skipped label restore for $project: folder changed, is missing, or overlaps OpenCave data or checkout"
+      printf 'SELinux cleanup pending for %q. If moved, return the original folder to this path and retry.\n' "$project" >&2
+      pending+=("${recorded[$project]}"$'\t'"$project")
       continue
     fi
     busy=no
@@ -624,11 +808,13 @@ reset_project_labels() {
       if paths_overlap "$project" "$mount"; then busy=yes; break; fi
     done
     if [ "$busy" = yes ]; then
-      warn "skipped label restore for $project: still used by a Podman container"
+      printf 'SELinux cleanup pending for %q. Stop the container using it and retry.\n' "$project" >&2
+      pending+=("${recorded[$project]}"$'\t'"$project")
       continue
     fi
     if ! mount=$(project_mountpoint "$project") || [ -n "$mount" ]; then
-      warn "skipped label restore for $project: contains a mountpoint or could not verify mounts"
+      printf 'SELinux cleanup pending for %q. Check for nested mounts and retry.\n' "$project" >&2
+      pending+=("${recorded[$project]}"$'\t'"$project")
       continue
     fi
     # Leave any later non-:z labels alone.
@@ -637,9 +823,23 @@ reset_project_labels() {
         restorecon -F -0 -f -; } 2>&1
     ) || [ -n "$diagnostics" ]; then
       [ -z "$diagnostics" ] || printf '%s\n' "$diagnostics" >&2
-      warn "could not confirm a full SELinux label restore on $project; check it manually"
+      printf 'SELinux cleanup pending for %q. Label restoration did not complete.\n' "$project" >&2
+      pending+=("${recorded[$project]}"$'\t'"$project")
+    else
+      printf 'Restored SELinux labels under %q.\n' "$project"
     fi
   done
+  if [ "${#pending[@]}" -eq 0 ]; then
+    rm -f -- "$ledger"
+    return
+  fi
+
+  local tmp
+  tmp=$(mktemp "$DATA/.selinux-default-projects.XXXXXX") || return 1
+  if ! printf '%s\n' "${pending[@]}" > "$tmp" || ! mv -f -- "$tmp" "$ledger"; then
+    rm -f -- "$tmp"
+  fi
+  return 1
 }
 
 serve() {
@@ -701,7 +901,7 @@ serve() {
     die "port $OPENCHAMBER_PORT is already in use; set OPENCHAMBER_PORT in $ENV_FILE"
   fi
   write_config
-  start_server passwords
+  start_server
 }
 
 serve_restart() {
@@ -766,7 +966,6 @@ serve_logs() {
 
 resolve_versions() {
   local latest
-  versions_changed=no
 
   latest=$(curl --disable -fsSL --max-time 15 \
     'https://api.github.com/repos/anomalyco/opencode/releases?per_page=100' 2>/dev/null |
@@ -775,15 +974,7 @@ resolve_versions() {
   if [ -z "$latest" ]; then
     die "could not find an OpenCode v2 release; set a known-good OPENCODE_TAG in $ENV_FILE and retry"
   fi
-  if [ "$latest" = "$OPENCODE_TAG" ]; then
-    printf 'OpenCode: %s is up to date.\n' "$OPENCODE_TAG"
-  elif [ "$(printf '%s\n%s\n' "$OPENCODE_TAG" "$latest" | sort -V | tail -n1)" != "$latest" ]; then
-    printf 'OpenCode: keeping %s (remote %s is older).\n' "$OPENCODE_TAG" "$latest"
-  else
-    printf 'OpenCode: %s -> %s.\n' "$OPENCODE_TAG" "$latest"
-    OPENCODE_TAG=$latest
-    versions_changed=yes
-  fi
+  OPENCODE_TAG=$(printf '%s\n%s\n' "$OPENCODE_TAG" "$latest" | sort -V | tail -n1)
 
   latest=$(curl --disable -fsSL --max-time 15 \
     'https://registry.npmjs.org/@openchamber%2Fweb/latest' 2>/dev/null |
@@ -791,63 +982,82 @@ resolve_versions() {
   if [[ ! "$latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     die "could not find an OpenChamber release; set a known-good OPENCHAMBER_VERSION in $ENV_FILE and retry"
   fi
-  if [ "$latest" = "$OPENCHAMBER_VERSION" ]; then
-    printf 'OpenChamber: %s is up to date.\n' "$OPENCHAMBER_VERSION"
-  elif [ "$(printf '%s\n%s\n' "$OPENCHAMBER_VERSION" "$latest" | sort -V | tail -n1)" != "$latest" ]; then
-    printf 'OpenChamber: keeping %s (remote %s is older).\n' "$OPENCHAMBER_VERSION" "$latest"
-  else
-    printf 'OpenChamber: %s -> %s.\n' "$OPENCHAMBER_VERSION" "$latest"
-    OPENCHAMBER_VERSION=$latest
-    versions_changed=yes
-  fi
+  OPENCHAMBER_VERSION=$(printf '%s\n%s\n' "$OPENCHAMBER_VERSION" "$latest" | sort -V | tail -n1)
 }
 
 update_command() {
-  local build_flag=$1 was_running=no ui_running=no current_image= built_image=
-  if server_running; then was_running=yes; fi
-  if [ "$OPENCHAMBER" = yes ] && openchamber_running; then ui_running=yes; fi
-  if [ "$was_running" = yes ]; then
-    [ -n "$WORKSPACE" ] || die "a server is running but its folder is unknown; use 'opencave serve-stop' and serve again"
-    WORKSPACE=$(absolute_path "$WORKSPACE") || exit 1
-    [ -d "$WORKSPACE" ] || die "server folder is missing: $WORKSPACE"
-    require_project_mount "$WORKSPACE"
-    require_data_mounts
-    validate_port "$PORT"
-    if [ "$OPENCHAMBER" = yes ]; then
-      validate_port "$OPENCHAMBER_PORT"
-      [ "$OPENCHAMBER_PORT" != "$PORT" ] || die "OpenCode and OpenChamber need different host ports"
-      OPENCHAMBER_UI_PASSWORD=${OPENCHAMBER_UI_PASSWORD:-$(password)}
-      write_config
-    fi
+  local build_flag=$1 before=$OPENCODE_TAG chamber_before=$OPENCHAMBER_VERSION
+  require_rootfs
+  if server_containers; then die "run opencave serve-stop before updating"; fi
+  require_idle_data
+  [ -t 0 ] || die "opencave --update needs a terminal for confirmation"
+  printf 'Updating replaces the container system outside /root. Your home and projects are kept.\n'
+  if ! ask_yes "Update the OpenCave system?" no; then
+    printf 'Cancelled.\n'
+    return 0
   fi
 
+  printf 'Checking for releases…\n'
   resolve_versions
   build_image "$build_flag"
-  if [ "$versions_changed" = yes ]; then
-    write_config
-    printf 'Saved the new versions in %s.\n' "$ENV_FILE"
+  replace_rootfs update
+  write_config
+  if [ "$OPENCODE_TAG" = "$before" ]; then
+    printf 'OpenCode has no newer release (%s).\n' "$OPENCODE_TAG"
+  else
+    printf 'OpenCode updated to %s.\n' "$OPENCODE_TAG"
   fi
-
-  if [ "$was_running" = yes ]; then
-    current_image=$(podman container inspect --format '{{.Image}}' opencave 2>/dev/null) || current_image=
-    built_image=$(podman image inspect --format '{{.Id}}' "$IMAGE")
-    if [ "${current_image#sha256:}" != "${built_image#sha256:}" ] ||
-      [ "$versions_changed" = yes ]; then
-      stop_server
-      if [ "$ui_running" = no ]; then OPENCHAMBER=no; fi
-      start_server
-    fi
+  if [ "$OPENCHAMBER_VERSION" = "$chamber_before" ]; then
+    printf 'OpenChamber has no newer release (%s).\n' "$OPENCHAMBER_VERSION"
+  else
+    printf 'OpenChamber will use %s the next time it starts.\n' "$OPENCHAMBER_VERSION"
+  fi
+  if ! remove_owned_images "$IMAGE" "$BASE_IMAGE:$OPENCODE_TAG"; then
+    warn "Some old images remain. Cleanup will retry on the next update or uninstall."
   fi
 }
 
+reset_server_settings() (
+  local config=$ENV_FILE data=$DATA opencode_tag=$OPENCODE_TAG chamber_version=$OPENCHAMBER_VERSION
+  ENV_FILE=/dev/null
+  load_config
+  ENV_FILE=$config
+  DATA=$data
+  OPENCODE_TAG=$opencode_tag
+  OPENCHAMBER_VERSION=$chamber_version
+  OPENCODE_SERVER_PASSWORD=$(password)
+  write_config
+)
+
+reset() {
+  case "${1:-}" in
+    -h|--help) printf 'Usage: opencave --reset\n'; return ;;
+  esac
+  [ "$#" -eq 0 ] || die "usage: opencave --reset"
+  require_install
+  [ -t 0 ] || die "opencave --reset needs a terminal for confirmation"
+  require_owned_data
+  printf 'Reset deletes chats, settings, skills, and the internal Linux filesystem.\n'
+  printf 'Provider logins and project files are kept. You can import host skills afterward.\n'
+  if ! ask_yes "Reset OpenCave?" no; then
+    printf 'Cancelled.\n'
+    return 0
+  fi
+  require_rootfs
+  replace_rootfs reset
+  printf 'OpenCave reset complete.\n'
+  import_skills setup || warn "skill import did not finish. Retry with opencave import-skills."
+}
+
 uninstall() {
-  local delete_data=no
+  local delete_data=no delete_source=no app_dir=$HOME_DIR/.local/share/opencave marker=$ENV_FILE.bootstrap
   [ -L "$CLI" ] && [ "$(readlink -f -- "$CLI")" = "$SCRIPT_DIR/setup.sh" ] ||
-    die "this is not the installed checkout; run 'opencave uninstall'"
+    die "this is not the installed checkout; run 'opencave --uninstall'"
   [ -f "$ENV_FILE" ] || die "settings are missing: $ENV_FILE; run ./setup.sh here and retry"
 
-  printf 'OpenCave will remove the server, CLI, and .env.\n'
-  if [ -f "$DATA/.opencave-owner" ] && [ "$(< "$DATA/.opencave-owner")" = "$SCRIPT_DIR" ] &&
+  printf 'OpenCave will remove its containers, tracked images, CLI, and settings.\n'
+  if [ ! -L "$DATA/.opencave-owner" ] &&
+    [ -f "$DATA/.opencave-owner" ] && [ "$(< "$DATA/.opencave-owner")" = "$SCRIPT_DIR" ] &&
     ! contains_path "$DATA" "$WORKSPACE" && ! contains_path "$DATA" "$SCRIPT_DIR" &&
     ! contains_path "$DATA" "$(realpath -m -- "$HOME")"; then
     delete_data=yes
@@ -855,9 +1065,21 @@ uninstall() {
   else
     printf 'Data kept: %s (shared or unmarked)\n' "$DATA"
   fi
-  printf 'Kept: project folders and their files, image, checkout.\n'
+  if [ -f "$marker" ] && [ ! -L "$marker" ] && [ "$(< "$marker")" = "$SCRIPT_DIR" ] &&
+    [ ! -e "$SCRIPT_DIR/.git" ] && [ ! -L "$SCRIPT_DIR/.git" ] &&
+    ! contains_path "$SCRIPT_DIR" "$HOME_DIR" && ! contains_path "$SCRIPT_DIR" "$WORKSPACE" &&
+    { [ "$delete_data" = yes ] || ! contains_path "$SCRIPT_DIR" "$DATA"; }; then
+    delete_source=yes
+    printf 'Bootstrap source to remove: %s\n' "$SCRIPT_DIR"
+  fi
   if [ "$yes_flag" = no ]; then
-    [ -t 0 ] && ask_yes "Uninstall OpenCave?" no || die "cancelled (use --yes for unattended uninstall)"
+    [ -t 0 ] || die "use --yes for unattended uninstall"
+    if [ "$keep_labels" = no ]; then show_project_label_cleanup; fi
+    if ! ask_yes "Uninstall OpenCave?" no; then
+      printf 'Uninstall cancelled.\n'
+      if [ "$keep_labels" = no ]; then show_project_label_cleanup manual; fi
+      return 0
+    fi
   fi
 
   stop_server
@@ -865,11 +1087,26 @@ uninstall() {
   # An attached TUI or shell may need a moment to release its lock.
   lock_data 5
   require_idle_data
-  reset_project_labels
-  if [ "$delete_data" = yes ]; then
-    rm -rf --one-file-system -- "$DATA"
+  if [ "$delete_data" = yes ]; then require_unmounted_path "$DATA"; fi
+  if [ "$delete_source" = yes ]; then require_unmounted_path "$SCRIPT_DIR"; fi
+  if [ "$keep_labels" = no ] && ! reset_project_labels; then
+    printf 'Uninstall paused. Rerun opencave --uninstall to retry.\n' >&2
+    show_project_label_cleanup manual >&2
+    return 1
   fi
-  rm -f -- "$ENV_FILE" "$CLI"
+  if ! remove_owned_images; then
+    printf 'Image cleanup pending. Check the Podman output and rerun opencave --uninstall.\n' >&2
+    return 1
+  fi
+  if [ "$delete_data" = yes ]; then
+    podman unshare rm -rf --one-file-system -- "$DATA"
+    if [[ "$DATA" == */opencave/data && "${DATA%/data}" != "$app_dir" ]]; then
+      rmdir -- "${DATA%/data}" 2>/dev/null || true
+    fi
+  fi
+  if [ "$delete_source" = yes ]; then rm -rf --one-file-system -- "$SCRIPT_DIR"; fi
+  rm -f -- "$BASE_IMAGES_FILE" "$ENV_FILE" "$CLI"
+  rmdir -- "$app_dir" 2>/dev/null || true
   printf 'OpenCave uninstalled.\n'
 }
 
@@ -877,40 +1114,30 @@ open_session() {
   require_install
   local mode=$1 dir name mount_mode workdir=/root
   shift
-  require_data_mounts
-  local mounts=(
-    -v "$DATA/share:/root/.local/share/opencode:z"
-    -v "$DATA/state:/root/.local/state/opencode:z"
-    -v "$DATA/bin:/root/.local/bin:z"
-    -v "$DATA/cache:/root/.cache:z"
-    -v "$DATA/config:/root/.config/opencode:z"
-    -v "$DATA/agents:/root/.agents:z"
-  )
-  local args=("$IMAGE" --standalone)
+  local -a mounts=() args=(opencode --standalone)
   if [ "$mode" = shell ]; then
     [ "$#" -eq 0 ] || die "usage: opencave shell"
-    args=(--entrypoint bash "$IMAGE")
+    args=(/bin/bash)
   else
     [ "$#" -le 1 ] || die "usage: opencave [DIR]"
-    dir=$(absolute_path "${1:-$CALL_DIR}")
+    dir=$(absolute_path "${1:-$CALL_DIR}") || exit 1
     [ -d "$dir" ] || die "not a directory: $dir"
     require_project_mount "$dir"
     name=${dir##*/}
     workdir=/workspace/${name:-workspace}
   fi
 
-  [ -d "$DATA/share" ] || die "OpenCave data is missing; run ./setup.sh"
-  mkdir -p -- "$DATA/agents" || die "could not create $DATA/agents"
+  require_rootfs
   # Keep the lock in this process until Podman exits.
-  exec 8< "$DATA/share"
-  flock -sn 8 || die "OpenCave data is being removed"
+  exec 8< "$DATA"
+  flock -sn 8 || die "OpenCave is busy. Retry after the current maintenance command finishes."
   [ -f "$ENV_FILE" ] || die "OpenCave was uninstalled"
   if [ "$mode" != shell ]; then
     mount_mode=$(project_mount_mode "$dir") || exit 1
-    mounts=( -v "$dir:$workdir:$mount_mode" "${mounts[@]}" )
+    mounts=(-v "$dir:$workdir:$mount_mode")
   fi
-  podman run --rm -it --security-opt no-new-privileges:true \
-    "${mounts[@]}" -w "$workdir" "${args[@]}" 8<&-
+  podman run --rm -it --label "$IMAGE_OWNER=$SCRIPT_DIR" "${ROOTFS_OPTIONS[@]}" --env "PATH=$ROOTFS_PATH" \
+    "${mounts[@]}" -w "$workdir" --rootfs "$ROOTFS" "${args[@]}" 8<&-
 }
 
 case "${1:-}" in
@@ -922,7 +1149,10 @@ fi
 
 cmd=${1:-}
 case "$cmd" in
-  shell|creds|serve|serve-stop|serve-restart|serve-status|serve-logs|update|version|import-auth|import-skills|uninstall)
+  --reset|--update|--uninstall)
+    cmd=${cmd#--}
+    shift ;;
+  shell|creds|serve|serve-stop|serve-restart|serve-status|serve-logs|update|version|import-auth|import-skills|reset|uninstall)
     shift ;;
   '')
     if [ "${0##*/}" = opencave ]; then cmd=session; else cmd=setup; fi ;;
@@ -933,20 +1163,25 @@ esac
 if [ "$cmd" != creds ]; then
   command -v podman >/dev/null || die "install rootless Podman first; see the README"
   command -v flock >/dev/null || die "install flock (util-linux) first"
+  require_rootless_podman
 fi
 HOME_DIR=$(absolute_path "$HOME")
 
 # Serialize configuration and server changes.
 case "$cmd" in
-  setup|serve|serve-stop|serve-restart|update|uninstall|import-auth|import-skills)
+  setup|serve|serve-stop|serve-restart|update|reset|uninstall|import-auth|import-skills)
     exec 9< "$SCRIPT_DIR"
-    flock -x 9 ;;
+    if ! flock -xn 9; then
+      printf 'Waiting for another OpenCave command to finish…\n'
+      flock -x 9
+    fi ;;
 esac
 
 first_install=no
 [ -f "$ENV_FILE" ] || first_install=yes
 load_config
 DATA=$(absolute_path "${DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/opencave/data}" "$SCRIPT_DIR")
+ROOTFS=$DATA/rootfs
 
 case "$cmd" in
   creds)
@@ -980,14 +1215,18 @@ case "$cmd" in
   serve-stop) serve_stop "$@"; exit ;;
   serve-status) serve_status "$@"; exit ;;
   serve-logs) serve_logs "$@"; exit ;;
+  reset) reset "$@"; exit ;;
   session|shell) open_session "$cmd" "$@"; exit ;;
 esac
 
-yes_flag=no import_first=yes update_build_flag=
+yes_flag=no import_first=yes update_build_flag= keep_labels=no
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --no-import-auth) import_first=no ;;
     --yes) yes_flag=yes ;;
+    --keep-labels)
+      [ "$cmd" = uninstall ] || die "--keep-labels is for uninstall"
+      keep_labels=yes ;;
     --no-cache)
       [ "$cmd" = update ] || die "--no-cache is for update"
       update_build_flag=$1 ;;
@@ -1008,14 +1247,12 @@ case "$cmd" in
   update)
     require_install
     command -v curl >/dev/null || die "install curl first"
-    require_rootless_podman
     update_command "$update_build_flag"
     exit ;;
   setup) ;;
   *) die "unknown command: $cmd" ;;
 esac
 
-require_rootless_podman
 require_data_mounts
 if contains_path "$DATA" "$SCRIPT_DIR"; then
   die "DATA must not contain the checkout"
@@ -1026,9 +1263,16 @@ if [ -e "$CLI" ] || [ -L "$CLI" ]; then
 fi
 
 umask 077
-if ! podman image exists "$IMAGE"; then build_image; fi
+if podman image exists "$IMAGE"; then
+  [ "$(podman image inspect --format "{{index .Labels \"$IMAGE_OWNER\"}}" "$IMAGE")" = "$SCRIPT_DIR" ] ||
+    die "image $IMAGE does not belong to this OpenCave checkout"
+else
+  build_image
+fi
 if [ -f "$ENV_FILE" ]; then stop_server; fi
 prepare_data
+if [ ! -d "$ROOTFS" ]; then replace_rootfs init; fi
+require_rootfs
 OPENCODE_SERVER_PASSWORD=${OPENCODE_SERVER_PASSWORD:-$(password)}
 if [ "$OPENCHAMBER" = yes ]; then
   OPENCHAMBER_UI_PASSWORD=${OPENCHAMBER_UI_PASSWORD:-$(password)}
@@ -1044,4 +1288,4 @@ if [ ! -L "$CLI" ]; then
   mkdir -p -- "$(dirname -- "$CLI")"
   ln -s -- "$SCRIPT_DIR/setup.sh" "$CLI"
 fi
-printf 'OpenCave is ready. Open a TUI with opencave, or serve a folder with opencave serve [DIR].\n'
+printf 'OpenCave is ready.\n'
