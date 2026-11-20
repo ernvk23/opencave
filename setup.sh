@@ -49,12 +49,11 @@ opencave creds              Show saved server URLs and passwords
 
 opencave import-auth        Import saved credentials from host OpenCode
 opencave import-skills [DIR] Copy global skills and preview conflicts
-opencave --update           Update versions and rebuild the image
-opencave --update --no-cache
-                            Also force an Alpine package refresh
-opencave --reset            Start over and keep provider logins
-opencave version            Show the installed image's OpenCode version
-opencave --uninstall [--yes] [--keep-labels]
+opencave update             Update OpenCode and OpenChamber versions
+opencave update --system    Also upgrade Alpine packages
+opencave reset              Start over and keep provider logins
+opencave version            Show the installed OpenCode version
+opencave uninstall [--yes] [--keep-labels]
 HELP
 }
 
@@ -302,11 +301,8 @@ image_version() {
     "${ROOTFS_OPTIONS[@]}" --rootfs "$ROOTFS" opencode --version 8<&- 9<&-
 }
 
-build_image() {
+pull_opencode_image() {
   local base=$BASE_IMAGE:$OPENCODE_TAG before pulled
-  local -a options=()
-  if [ "${1:-}" = --no-cache ]; then options=(--no-cache); fi
-
   before=$(podman image ls --all --quiet --no-trunc) || die "could not list local images"
   printf 'Pulling OpenCode %s…\n' "$OPENCODE_TAG"
   podman pull "$base" || die "could not pull $base"
@@ -317,11 +313,43 @@ build_image() {
   if ! grep -Fxq -e "$pulled" -e "sha256:$pulled" <<< "$before"; then
     (umask 077; printf '%s %s\n' "$pulled" "$base" >> "$BASE_IMAGES_FILE")
   fi
+}
 
+build_image() {
+  pull_opencode_image
   printf 'Building the OpenCave image…\n'
   podman build --pull=never --force-rm --label "$IMAGE_OWNER=$SCRIPT_DIR" \
-    "${options[@]}" --build-arg "OPENCODE_TAG=$OPENCODE_TAG" -t "$IMAGE" . ||
+    --build-arg "OPENCODE_TAG=$OPENCODE_TAG" -t "$IMAGE" . ||
     die "could not build OpenCode $OPENCODE_TAG"
+}
+
+install_opencode() (
+  local rootfs=$1 base=$BASE_IMAGE:$OPENCODE_TAG binary
+  if ! podman image exists "$base"; then pull_opencode_image; fi
+  binary=$(mktemp "$DATA/.opencode.XXXXXX")
+  trap 'rm -f -- "$binary"' EXIT
+  podman run --rm --network=none --entrypoint /bin/cat "$base" \
+    /usr/local/bin/opencode 8<&- 9<&- > "$binary" ||
+    die "could not extract OpenCode $OPENCODE_TAG"
+  podman run --rm -i --network=none "${ROOTFS_OPTIONS[@]}" --rootfs "$rootfs" /bin/sh -ec '
+    candidate=$(mktemp /usr/local/bin/.opencode.XXXXXX)
+    trap '\''rm -f -- "$candidate"'\'' EXIT
+    cat > "$candidate"
+    chmod 755 "$candidate"
+    version=$("$candidate" --version)
+    version=${version##* }
+    [ "${version#v}" = "$1" ]
+    mv -fT -- "$candidate" /usr/local/bin/opencode
+  ' install-opencode "$OPENCODE_TAG" 8<&- 9<&- < "$binary" ||
+    die "could not install OpenCode $OPENCODE_TAG"
+)
+
+rootfs_opencode_version() {
+  local version
+  version=$(podman run --rm --network=none "${ROOTFS_OPTIONS[@]}" --rootfs "$1" \
+    opencode --version 8<&- 9<&-) || return 1
+  version=${version##* }
+  printf '%s\n' "${version#v}"
 }
 
 remove_owned_image() {
@@ -585,20 +613,11 @@ unpack_image() (
   local destination=$1 seed
   mkdir -p -- "$destination"
   seed=$(podman create --pull=never "$IMAGE" 8<&- 9<&-) ||
-    die "OpenCave image is missing. Run ./setup.sh or opencave --update"
+    die "OpenCave image is missing. Run ./setup.sh"
   trap 'podman rm --force --ignore "$seed" >/dev/null' EXIT
   podman export "$seed" 8<&- 9<&- |
     podman unshare tar -xpf - -C "$destination" 8<&- 9<&-
 )
-
-copy_directory() {
-  local source=$1 destination=$2
-  require_unmounted_path "$source"
-  require_unmounted_path "$destination"
-  podman unshare rm -rf --one-file-system -- "$destination"
-  mkdir -p -- "$(dirname -- "$destination")"
-  podman unshare cp -aT -- "$source" "$destination"
-}
 
 restore_rootfs() {
   if [ -d "$stage/old" ]; then
@@ -608,7 +627,7 @@ restore_rootfs() {
 }
 
 replace_rootfs() (
-  local mode=$1 stage path committed=no
+  local mode=$1 stage path version committed=no
   require_owned_data
   lock_data
   if [ "$mode" = init ] && [ -d "$ROOTFS" ]; then return 0; fi
@@ -634,21 +653,16 @@ replace_rootfs() (
 
   printf 'Preparing the shared filesystem…\n'
   unpack_image "$stage/new"
-  if [ "$mode" = update ]; then
-    printf 'Copying your OpenCave home…\n'
-    copy_directory "$ROOTFS/root" "$stage/new/root"
-  fi
-
   # The extracted filesystem needs the shared SELinux label.
   if [ "$(podman_selinux)" = true ]; then
     printf 'Labeling the shared filesystem for SELinux…\n'
     podman unshare chcon -Rh -t container_file_t -l s0 -- "$stage/new"
   fi
 
-  podman run --rm --network=none "${ROOTFS_OPTIONS[@]}" --rootfs "$stage/new" \
-    opencode --version >/dev/null 8<&- 9<&-
+  version=$(rootfs_opencode_version "$stage/new")
 
   if [ "$mode" = reset ]; then
+    if [ "$version" != "$OPENCODE_TAG" ]; then install_opencode "$stage/new"; fi
     printf 'Preserving provider logins…\n'
     if ! podman run --rm --network=none "${ROOTFS_OPTIONS[@]}" --rootfs "$ROOTFS" \
       opencode --standalone auth export 2>/dev/null 8<&- 9<&- |
@@ -764,7 +778,7 @@ HELP
   find "$project" -xdev -context '*:object_r:container_file_t:s0' -print0 | restorecon -nFv -0 -f -
   # Apply the changes after reviewing the preview
   find "$project" -xdev -context '*:object_r:container_file_t:s0' -print0 | restorecon -Fv -0 -f -
-Then run opencave --uninstall --keep-labels after handling all listed folders.
+Then run opencave uninstall --keep-labels after handling all listed folders.
 HELP
 }
 
@@ -986,21 +1000,31 @@ resolve_versions() {
 }
 
 update_command() {
-  local build_flag=$1 before=$OPENCODE_TAG chamber_before=$OPENCHAMBER_VERSION
+  local update_system=$1 before chamber_before=$OPENCHAMBER_VERSION
   require_rootfs
   if server_containers; then die "run opencave serve-stop before updating"; fi
   require_idle_data
-  [ -t 0 ] || die "opencave --update needs a terminal for confirmation"
-  printf 'Updating replaces the container system outside /root. Your home and projects are kept.\n'
-  if ! ask_yes "Update the OpenCave system?" no; then
+  [ -t 0 ] || die "opencave update needs a terminal for confirmation"
+  printf 'Updates OpenCode and OpenChamber versions. Keeps your data untouched.\n'
+  if [ "$update_system" = yes ]; then printf 'Also upgrades Alpine packages in OpenCave.\n'; fi
+  if ! ask_yes "Update OpenCave?" no; then
     printf 'Cancelled.\n'
     return 0
   fi
 
   printf 'Checking for releases…\n'
   resolve_versions
-  build_image "$build_flag"
-  replace_rootfs update
+  lock_data
+  require_idle_data
+  if [ "$update_system" = yes ]; then
+    podman run --rm "${ROOTFS_OPTIONS[@]}" --rootfs "$ROOTFS" \
+      apk upgrade --no-cache 8<&- 9<&- || die "could not upgrade Alpine packages"
+  fi
+  before=$(rootfs_opencode_version "$ROOTFS") || die "could not check the installed OpenCode version"
+  if [ "$OPENCODE_TAG" != "$before" ]; then
+    printf 'Installing OpenCode %s…\n' "$OPENCODE_TAG"
+    install_opencode "$ROOTFS"
+  fi
   write_config
   if [ "$OPENCODE_TAG" = "$before" ]; then
     printf 'OpenCode has no newer release (%s).\n' "$OPENCODE_TAG"
@@ -1031,11 +1055,11 @@ reset_server_settings() (
 
 reset() {
   case "${1:-}" in
-    -h|--help) printf 'Usage: opencave --reset\n'; return ;;
+    -h|--help) printf 'Usage: opencave reset\n'; return ;;
   esac
-  [ "$#" -eq 0 ] || die "usage: opencave --reset"
+  [ "$#" -eq 0 ] || die "usage: opencave reset"
   require_install
-  [ -t 0 ] || die "opencave --reset needs a terminal for confirmation"
+  [ -t 0 ] || die "opencave reset needs a terminal for confirmation"
   require_owned_data
   printf 'Reset deletes chats, settings, skills, and the internal Linux filesystem.\n'
   printf 'Provider logins and project files are kept. You can import host skills afterward.\n'
@@ -1052,7 +1076,7 @@ reset() {
 uninstall() {
   local delete_data=no delete_source=no app_dir=$HOME_DIR/.local/share/opencave marker=$ENV_FILE.bootstrap
   [ -L "$CLI" ] && [ "$(readlink -f -- "$CLI")" = "$SCRIPT_DIR/setup.sh" ] ||
-    die "this is not the installed checkout; run 'opencave --uninstall'"
+    die "this is not the installed checkout; run 'opencave uninstall'"
   [ -f "$ENV_FILE" ] || die "settings are missing: $ENV_FILE; run ./setup.sh here and retry"
 
   printf 'OpenCave will remove its containers, tracked images, CLI, and settings.\n'
@@ -1090,12 +1114,12 @@ uninstall() {
   if [ "$delete_data" = yes ]; then require_unmounted_path "$DATA"; fi
   if [ "$delete_source" = yes ]; then require_unmounted_path "$SCRIPT_DIR"; fi
   if [ "$keep_labels" = no ] && ! reset_project_labels; then
-    printf 'Uninstall paused. Rerun opencave --uninstall to retry.\n' >&2
+    printf 'Uninstall paused. Rerun opencave uninstall to retry.\n' >&2
     show_project_label_cleanup manual >&2
     return 1
   fi
   if ! remove_owned_images; then
-    printf 'Image cleanup pending. Check the Podman output and rerun opencave --uninstall.\n' >&2
+    printf 'Image cleanup pending. Check the Podman output and rerun opencave uninstall.\n' >&2
     return 1
   fi
   if [ "$delete_data" = yes ]; then
@@ -1149,9 +1173,6 @@ fi
 
 cmd=${1:-}
 case "$cmd" in
-  --reset|--update|--uninstall)
-    cmd=${cmd#--}
-    shift ;;
   shell|creds|serve|serve-stop|serve-restart|serve-status|serve-logs|update|version|import-auth|import-skills|reset|uninstall)
     shift ;;
   '')
@@ -1219,7 +1240,7 @@ case "$cmd" in
   session|shell) open_session "$cmd" "$@"; exit ;;
 esac
 
-yes_flag=no import_first=yes update_build_flag= keep_labels=no
+yes_flag=no import_first=yes update_system=no keep_labels=no
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --no-import-auth) import_first=no ;;
@@ -1227,9 +1248,9 @@ while [ "$#" -gt 0 ]; do
     --keep-labels)
       [ "$cmd" = uninstall ] || die "--keep-labels is for uninstall"
       keep_labels=yes ;;
-    --no-cache)
-      [ "$cmd" = update ] || die "--no-cache is for update"
-      update_build_flag=$1 ;;
+    --system)
+      [ "$cmd" = update ] || die "--system is for update"
+      update_system=yes ;;
     -h|--help) show_usage; exit 0 ;;
     *) die "unexpected argument: $1 (see opencave help)" ;;
   esac
@@ -1247,7 +1268,7 @@ case "$cmd" in
   update)
     require_install
     command -v curl >/dev/null || die "install curl first"
-    update_command "$update_build_flag"
+    update_command "$update_system"
     exit ;;
   setup) ;;
   *) die "unknown command: $cmd" ;;
@@ -1289,3 +1310,6 @@ if [ ! -L "$CLI" ]; then
   ln -s -- "$SCRIPT_DIR/setup.sh" "$CLI"
 fi
 printf 'OpenCave is ready.\n'
+if ! command -v opencave >/dev/null; then
+  printf '%s\n' 'Run this in your current shell to use opencave:' '  export PATH="$HOME/.local/bin:$PATH"'
+fi
