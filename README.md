@@ -24,8 +24,8 @@ Or run `./setup.sh` from a checkout.
 ```sh
 opencave [DIR]                   # OpenCode in a project
 opencave shell                   # Open a shell
-opencave serve [DIR]             # Start the server
-opencave serve --openchamber     # Include the web UI
+opencave serve [DIR]             # Start OpenCode web UI
+opencave serve [DIR] --openchamber # Add the OpenChamber UI
 opencave import-skills [DIR]     # Import host skills
 opencave help                    # List commands
 

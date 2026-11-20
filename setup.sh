@@ -38,13 +38,16 @@ opencave DIR                Open a TUI in DIR
 opencave shell              Open Bash with shared tools and config
 opencave help               Show this help
 
-opencave serve [DIR]        Start a server for DIR (default: current folder)
-opencave serve --openchamber
+opencave serve [DIR]        Start the OpenCode web UI
+                            (default: current folder)
+opencave serve [DIR] --openchamber
+                            Add the OpenChamber UI
 opencave serve-stop         Stop the server
-opencave serve-restart      Restart the last served folder
+opencave serve-restart      Restart the last server
+                            (keeps a running OpenChamber)
 opencave serve-status       Show server status
 opencave serve-logs [openchamber]
-                            Follow OpenCode logs (or the UI logs)
+                            Follow OpenCode logs (or OpenChamber)
 opencave creds              Show saved server URLs and passwords
 
 opencave import-auth        Import saved credentials from host OpenCode
@@ -128,7 +131,7 @@ load_config() {
   local key value
   while IFS='=' read -r key value || [ -n "$key" ]; do
     case "$key" in
-      WORKSPACE|DATA|PORT|BIND_ADDR|OPENCODE_SERVER_PASSWORD|OPENCHAMBER|OPENCODE_TAG|OPENCHAMBER_VERSION|OPENCHAMBER_PORT|OPENCHAMBER_UI_PASSWORD)
+      WORKSPACE|DATA|PORT|BIND_ADDR|OPENCODE_SERVER_PASSWORD|OPENCODE_TAG|OPENCHAMBER_VERSION|OPENCHAMBER_PORT|OPENCHAMBER_UI_PASSWORD)
         value=${value%$'\r'}
         printf -v "$key" '%s' "$value"
         ;;
@@ -141,7 +144,7 @@ write_config() {
   tmp=$(mktemp "$SCRIPT_DIR/.env.XXXXXX")
   printf '%s\n' \
     "WORKSPACE=$WORKSPACE" "DATA=$DATA" "PORT=$PORT" "BIND_ADDR=$BIND_ADDR" \
-    "OPENCODE_SERVER_PASSWORD=$OPENCODE_SERVER_PASSWORD" "OPENCHAMBER=$OPENCHAMBER" \
+    "OPENCODE_SERVER_PASSWORD=$OPENCODE_SERVER_PASSWORD" \
     "OPENCODE_TAG=$OPENCODE_TAG" "OPENCHAMBER_VERSION=$OPENCHAMBER_VERSION" \
     "OPENCHAMBER_PORT=$OPENCHAMBER_PORT" "OPENCHAMBER_UI_PASSWORD=$OPENCHAMBER_UI_PASSWORD" > "$tmp"
   if [ -f "$ENV_FILE" ] && cmp -s "$tmp" "$ENV_FILE"; then
@@ -194,9 +197,11 @@ print_status() {
   if [ "${1:-}" = passwords ] && [ -t 1 ]; then show_passwords=yes; fi
   printf 'OpenCode: %s (user: opencode)\n' "$(server_url)"
   if [ "$show_passwords" = yes ]; then printf '  Password: %s\n' "$OPENCODE_SERVER_PASSWORD"; fi
-  if [ "$OPENCHAMBER" = yes ] && openchamber_running; then
+  if openchamber_running; then
     printf 'OpenChamber: http://127.0.0.1:%s/\n' "$OPENCHAMBER_PORT"
     if [ "$show_passwords" = yes ]; then printf '  Password: %s\n' "$OPENCHAMBER_UI_PASSWORD"; fi
+  else
+    printf 'OpenChamber: off\n'
   fi
 }
 
@@ -887,7 +892,7 @@ serve() {
   PORT=${port:-$PORT}
   validate_port "$PORT"
 
-  [ -z "$openchamber" ] || OPENCHAMBER=$openchamber
+  OPENCHAMBER=${openchamber:-no}
   if [ "$OPENCHAMBER" = yes ]; then
     validate_port "$OPENCHAMBER_PORT"
     [ "$OPENCHAMBER_PORT" != "$PORT" ] || die "OpenCode and OpenChamber need different host ports"
@@ -906,13 +911,27 @@ serve() {
 
 serve_restart() {
   require_install
-  [ "$#" -eq 0 ] || die "usage: opencave serve-restart"
+  local openchamber=
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --openchamber) openchamber=yes ;;
+      --no-openchamber) openchamber=no ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "usage: opencave serve-restart [--openchamber|--no-openchamber]" ;;
+    esac
+    shift
+  done
   [ -n "$WORKSPACE" ] || die "no server has been configured; run 'opencave serve [DIR]' first"
   WORKSPACE=$(absolute_path "$WORKSPACE") || exit 1
   [ -d "$WORKSPACE" ] || die "server folder is missing: $WORKSPACE"
   require_project_mount "$WORKSPACE"
   require_data_mounts
   validate_port "$PORT"
+  if [ -z "$openchamber" ]; then
+    # A stopped server has no container to inspect; pass --openchamber then.
+    if openchamber_running; then openchamber=yes; else openchamber=no; fi
+  fi
+  OPENCHAMBER=$openchamber
   if [ "$OPENCHAMBER" = yes ]; then
     validate_port "$OPENCHAMBER_PORT"
     [ "$OPENCHAMBER_PORT" != "$PORT" ] || die "OpenCode and OpenChamber need different host ports"
@@ -1190,9 +1209,9 @@ case "$cmd" in
     printf '  Username: opencode\n'
     printf '  Password: %s\n' "${OPENCODE_SERVER_PASSWORD:-not set}"
     printf '\nOpenChamber\n'
-    if [ "$OPENCHAMBER" = yes ]; then
+    if [ -n "$OPENCHAMBER_UI_PASSWORD" ]; then
       printf '  URL:      http://127.0.0.1:%s/\n' "$OPENCHAMBER_PORT"
-      printf '  Password: %s\n' "${OPENCHAMBER_UI_PASSWORD:-not set}"
+      printf '  Password: %s\n' "$OPENCHAMBER_UI_PASSWORD"
     else
       printf '  off\n'
     fi
@@ -1272,9 +1291,6 @@ prepare_data
 if [ ! -d "$ROOTFS" ]; then replace_rootfs init; fi
 require_rootfs
 OPENCODE_SERVER_PASSWORD=${OPENCODE_SERVER_PASSWORD:-$(password)}
-if [ "$OPENCHAMBER" = yes ]; then
-  OPENCHAMBER_UI_PASSWORD=${OPENCHAMBER_UI_PASSWORD:-$(password)}
-fi
 if [ "$first_install" = yes ] && [ "$import_first" = yes ] && command -v opencode >/dev/null; then
   import_auth || true
 fi
