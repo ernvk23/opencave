@@ -2,7 +2,9 @@
 
 A rootless Podman container for [OpenCode](https://opencode.ai). Host file access is scoped to the mounted folder only. Optional [OpenChamber](https://openchamber.dev) web UI.
 
-![OpenCave isolation](assets/isolation.svg)
+## Overview
+
+![OpenCave overview](assets/overview.png)
 
 **Motivation:** ask your host agent whether it can read your browser's passwords, history, SSH keys, or anything — and see...
 
