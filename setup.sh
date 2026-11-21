@@ -51,7 +51,7 @@ opencave serve-logs [openchamber]
 opencave creds              Show saved server URLs and passwords
 
 opencave import-auth        Import saved credentials from host OpenCode
-opencave import-skills [DIR] Copy global skills and preview conflicts
+opencave import-skills [DIR] Copy host skills to .agents/skills
 opencave update             Update OpenCode and OpenChamber versions
 opencave update --system    Also upgrade Alpine packages in OpenCave
 opencave reset              Clear chats and packages, keep provider logins
@@ -439,121 +439,116 @@ skill_paths() {
   done
 }
 
-skill_copy_hint() {
-  printf 'To import manually, copy the skill and its supporting files to %q on the host.\n' "$1"
-  printf '%s\n' 'For a conflict, remove or replace the existing path shown first.'
-  printf '%s\n' 'Inside OpenCave: /root/.config/opencode/skills. Use real files instead of host symlinks; set up any required tools or MCPs separately.'
-}
-
 import_skills() (
   case "${1:-}" in -h|--help) printf '%s\n' 'Usage: opencave import-skills [DIR]'; exit ;; esac
   [ "$#" -le 1 ] || die "usage: opencave import-skills [DIR]"
   require_install
-  local root source target=$ROOTFS/root/.config/opencode/skills skill id old out unsafe answer
-  local agent_skills=$ROOTFS/root/.agents/skills
-  local -a roots=("${XDG_CONFIG_HOME:-$HOME/.config}/opencode/skills" "$HOME/.agents/skills")
-  local -a sources=() skills=() pending=()
-  local imported=0 skipped=0 overwrite=no has_conflicts=no
-  local -A existing=() ambiguous=() seen=() destinations=() planned=()
+
+  local target=$ROOTFS/root/.agents/skills
+  local source root skill id base dest explicit=no i
+  local new_count=0 conflict_count=0 imported=0 failed=0
+  local -a roots=() found=() plan_ids=()
+  local -A source_by_id=() base_by_id=()
+
   if [ "$#" -eq 1 ]; then
     [ -n "$1" ] || die "skills directory cannot be empty"
     roots=("$1")
+    explicit=yes
+  else
+    roots=(
+      "$HOME/.claude/skills"
+      "$HOME/.agents/skills"
+      "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/skills"
+    )
   fi
+
   for root in "${roots[@]}"; do
     source=$(absolute_path "$root") || exit 1
-    if [ ! -d "$source" ]; then
-      [ "$#" -eq 0 ] || die "skills directory not found: $source"
-      continue
-    fi
     if contains_path "$DATA" "$source" || contains_path "$source" "$DATA"; then
-      die "choose a skills directory that does not overlap OpenCave's data"
+      die "choose a skills path that does not overlap OpenCave's data"
     fi
-    sources+=("$source")
+    if [ "$explicit" = yes ]; then
+      if [ -f "$source/SKILL.md" ] || { [ -f "$source" ] && [[ "$source" == *.md ]]; }; then
+        found=("$source")
+      elif [ -d "$source" ]; then
+        mapfile -d '' -t found < <(skill_paths "$source")
+      else
+        die "skills path not found: $source"
+      fi
+    else
+      [ -d "$source" ] || continue
+      mapfile -d '' -t found < <(skill_paths "$source")
+    fi
+
+    for skill in "${found[@]}"; do
+      id=${skill##*/}
+      [ -d "$skill" ] || id=${id%.md}
+      if [ -d "$skill" ]; then base=$id; else base=${skill##*/}; fi
+      if [ -n "${source_by_id[$id]:-}" ]; then
+        printf 'Note: duplicate skill %q; using %q\n' "$id" "$skill"
+      else
+        plan_ids+=("$id")
+      fi
+      source_by_id["$id"]=$skill
+      base_by_id["$id"]=$base
+    done
   done
-  mapfile -d '' -t skills < <(for source in "${sources[@]}"; do skill_paths "$source"; done)
-  if [ "${#skills[@]}" -eq 0 ]; then
-    printf 'No host skills found.\n'
+
+  if [ "${#plan_ids[@]}" -eq 0 ]; then
+    if [ "$explicit" = yes ]; then
+      printf 'No skills found in %q.\n' "$source"
+    else
+      printf 'No host skills found.\n'
+    fi
     exit 0
   fi
+
   require_rootfs
   lock_data
   require_idle_data
-  require_unmounted_path "$target"
-  require_unmounted_path "$agent_skills"
-  [ ! -e "$target" ] || [ -d "$target" ] || die "not a regular skills directory: $target"
 
-  while IFS= read -r -d '' skill; do
-    id=${skill##*/}
-    [ -d "$skill" ] || id=${id%.md}
-    old=${existing[$id]:-}
-    if [[ "$skill" == "$target/"* && "$old" == "$target/"* ]]; then ambiguous["$id"]=yes; fi
-    existing["$id"]=$skill
-  done < <(skill_paths "$agent_skills"; skill_paths "$target")
-
-  for skill in "${skills[@]}"; do
-    id=${skill##*/}
-    [ -d "$skill" ] || id=${id%.md}
-    [ -z "${seen[$id]:-}" ] || continue
-    unsafe=$(find "$skill" ! -type f ! -type d -print -quit) || die "could not inspect $skill"
-    if [ -n "$unsafe" ]; then
-      printf 'Skipped %q: linked or special file %q\n' "$id" "$unsafe"
-      ((skipped += 1))
-      continue
+  printf 'Skills destination: /root/.agents/skills\n'
+  for i in "${plan_ids[@]}"; do
+    dest=$target/${base_by_id[$i]}
+    if [ ! -e "$dest" ] && [ ! -L "$dest" ]; then
+      printf '  NEW       %q -> %q\n' "${source_by_id[$i]}" "/root/.agents/skills/${base_by_id[$i]}"
+      new_count=$((new_count + 1))
     fi
-    seen["$id"]=$skill
-
-    old=${existing[$id]:-}
-    out=$target/${skill##*/}
-    if [[ "$old" == "$target/"* && "${old##*/}" == "${skill##*/}" ]]; then out=$old; fi
-    if [ "${ambiguous[$id]:-}" = yes ] || [ -n "${planned[$out]:-}" ] ||
-      { [ "$out" != "$old" ] && { [ -e "$out" ] || [ -L "$out" ]; }; }; then
-      printf 'Skipped %q: destination %q is ambiguous or occupied (existing %q)\n' "$skill" "$out" "${old:--}"
-      ((skipped += 1))
-      continue
-    fi
-    if [ -n "$old" ]; then
-      printf 'Conflict %q: incoming %q; existing %q\n' "$id" "$skill" "$old"
-      has_conflicts=yes
-    fi
-    pending+=("$id")
-    destinations["$id"]=$out
-    planned["$out"]=$id
   done
+  for i in "${plan_ids[@]}"; do
+    dest=$target/${base_by_id[$i]}
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+      printf '  REPLACE   %q -> %q\n' "${source_by_id[$i]}" "/root/.agents/skills/${base_by_id[$i]}"
+      conflict_count=$((conflict_count + 1))
+    fi
+  done
+  printf 'Summary: %s new, %s to replace.\n' "$new_count" "$conflict_count"
 
-  if [ "$has_conflicts" = yes ] && [ -t 0 ]; then
-    read -r -p 'Overwrite conflicts? [y] overwrite, [n] keep existing and copy new, [s] skip [y/n/S]: ' answer || answer=
-    case "${answer,,}" in
-      y|yes) overwrite=yes ;;
-      n|no) ;;
-      *) printf 'Import skipped; no skills were copied.\n'; skill_copy_hint "$target"; exit 0 ;;
-    esac
+  if ! ask_yes "Import ${#plan_ids[@]} skill(s) and replace $conflict_count existing?" no; then
+    printf 'Cancelled; no skills were copied.\n'
+    exit 0
   fi
 
   umask 077
-  for id in "${pending[@]}"; do
-    skill=${seen[$id]}
-    old=${existing[$id]:-}
-    out=${destinations[$id]}
-    if [ -n "$old" ] && [ "$overwrite" = no ]; then
-      ((skipped += 1))
-      continue
+  mkdir -p -- "$target" || die "could not create $target"
+  for i in "${plan_ids[@]}"; do
+    dest=$target/${base_by_id[$i]}
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+      if ! rm -rf -- "$dest"; then
+        warn "could not remove $dest"
+        failed=$((failed + 1))
+        continue
+      fi
     fi
-
-    mkdir -p -- "$target" || die "could not create $target"
-    if [ -n "$old" ]; then
-      rm -rf -- "$old" || die "could not remove $old"
+    if cp -R -- "${source_by_id[$i]}" "$dest"; then
+      imported=$((imported + 1))
+    else
+      warn "could not copy ${source_by_id[$i]} to $dest"
+      failed=$((failed + 1))
     fi
-    if [ -e "$out" ] || [ -L "$out" ]; then
-      die "destination appeared while importing: $out"
-    fi
-    if ! cp -R -- "$skill" "$out"; then
-      rm -rf -- "$out"
-      die "could not copy $skill to $out"
-    fi
-    ((imported += 1))
   done
-  printf 'Imported %s skill(s); skipped %s.\n' "$imported" "$skipped"
-  if [ "$skipped" -gt 0 ]; then skill_copy_hint "$target"; fi
+  printf 'Imported %s skill(s); %s failed.\n' "$imported" "$failed"
+  [ "$failed" -eq 0 ]
 )
 
 validate_port() {
@@ -782,7 +777,7 @@ HELP
 }
 
 reset_project_labels() {
-  local ledger=$DATA/.selinux-default-projects project ids mounts mount current busy diagnostics
+  local ledger=$DATA/.selinux-default-projects project ids mounts mount current busy diagnostics inode
   local -A recorded=()
   local -a containers=() active_mounts=() pending=()
   read_labeled_projects recorded || return 1
@@ -809,8 +804,10 @@ reset_project_labels() {
   fi
 
   for project in "${!recorded[@]}"; do
+    # Device numbers can change across mounts; the inode is the stable identity.
+    inode=$(stat -Lc '%i' -- "$project" 2>/dev/null) || inode=
     if [ ! -d "$project" ] || [ "$(realpath -e -- "$project" 2>/dev/null)" != "$project" ] ||
-      [ "$(stat -Lc '%d:%i' -- "$project" 2>/dev/null)" != "${recorded[$project]}" ] ||
+      [ -z "$inode" ] || [ "$inode" != "${recorded[$project]#*:}" ] ||
       paths_overlap "$project" "$DATA" || paths_overlap "$project" "$SCRIPT_DIR"; then
       printf 'SELinux cleanup pending for %q. If moved, return the original folder to this path and retry.\n' "$project" >&2
       pending+=("${recorded[$project]}"$'\t'"$project")
