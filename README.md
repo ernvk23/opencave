@@ -1,6 +1,10 @@
 # OpenCave
 
-A convenient rootless container for [OpenCode](https://opencode.ai). Agent access is scoped to the mounted folder, keeping the rest of the machine out of reach. Optional [OpenChamber](https://openchamber.dev) web UI.
+A rootless Podman container for [OpenCode](https://opencode.ai). Host file access is scoped to the mounted folder only. Optional [OpenChamber](https://openchamber.dev) web UI.
+
+![OpenCave isolation](assets/isolation.svg)
+
+**Motivation:** ask your host agent whether it can read your browser's passwords, history, SSH keys, or anything — and see...
 
 ## Prerequisites
 
@@ -33,6 +37,8 @@ opencave update                  # Update OpenCode and OpenChamber
 opencave update --system         # Also upgrade Alpine packages in OpenCave
 opencave reset                   # Clear chats and packages, keep provider logins
 ```
+
+More commands: `opencave help`.
 
 ## Uninstall
 
