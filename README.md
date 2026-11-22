@@ -48,6 +48,6 @@ More commands: `opencave help`.
 opencave uninstall
 ```
 
-Removes its containers, images, CLI, and local data. Mounted project folders are never touched.
+Removes OpenCave’s containers, images, CLI, local data, and the entire bootstrap-managed install directory. Mounted project folders are kept.
 
 [MIT license](LICENSE)

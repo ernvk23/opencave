@@ -13,7 +13,7 @@ IMAGE_OWNER=io.opencave.checkout
 CONTAINER_OWNER='{{.Label "io.opencave.checkout"}}'
 CLI=$HOME/.local/bin/opencave
 ROOTFS_PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ROOTFS_OPTIONS=(--security-opt no-new-privileges:true --tmpfs /tmp:exec,nodev,nosuid)
+ROOTFS_OPTIONS=(--security-opt no-new-privileges:true --security-opt label=disable --tmpfs /tmp:exec,nodev,nosuid)
 
 diagnostic() {
   local level=$1 color=$2
@@ -56,7 +56,7 @@ opencave update             Update OpenCode and OpenChamber versions
 opencave update --system    Also upgrade Alpine packages in OpenCave
 opencave reset              Clear chats and packages, keep provider logins
 opencave version            Show the installed OpenCode version
-opencave uninstall [--yes] [--keep-labels]
+opencave uninstall [--yes]
 HELP
 }
 
@@ -254,7 +254,7 @@ stop_server() {
 }
 
 start_server() (
-  local mount_mode name=${WORKSPACE##*/} workdir bind=$BIND_ADDR
+  local name=${WORKSPACE##*/} workdir bind=$BIND_ADDR
   case "$bind" in
     \[*\]) ;;
     *:*) bind="[$bind]" ;;
@@ -265,7 +265,6 @@ start_server() (
   require_project_mount "$WORKSPACE"
   require_rootfs
   workdir=/workspace/${name:-workspace}
-  mount_mode=$(project_mount_mode "$WORKSPACE") || exit 1
   if [ "$OPENCHAMBER" = yes ] && [ -n "$OPENCHAMBER_UI_PASSWORD" ]; then
     ports+=(-p "127.0.0.1:$OPENCHAMBER_PORT:3000")
   fi
@@ -274,7 +273,7 @@ start_server() (
     --label "$IMAGE_OWNER=$SCRIPT_DIR" \
     "${ROOTFS_OPTIONS[@]}" "${ports[@]}" --env "PATH=$ROOTFS_PATH" \
     --env OPENCODE_SERVER_PASSWORD \
-    -v "$WORKSPACE:$workdir:$mount_mode" -w "$workdir" --rootfs "$ROOTFS" \
+    -v "$WORKSPACE:$workdir:rw" -w "$workdir" --rootfs "$ROOTFS" \
     opencode serve --hostname 0.0.0.0 --port 4096 8<&- 9<&- >/dev/null ||
     die "could not start OpenCode"
   if ! wait_for_http; then
@@ -290,7 +289,7 @@ start_server() (
       --env OPENCODE_HOST=http://127.0.0.1:4096 --env OPENCODE_SKIP_START=true \
       --env OPENCODE_SERVER_PASSWORD --env OPENCHAMBER_HOST=0.0.0.0 \
       --env OPENCHAMBER_UI_PASSWORD \
-      -v "$WORKSPACE:$workdir:$mount_mode" -w "$workdir" --rootfs "$ROOTFS" \
+      -v "$WORKSPACE:$workdir:rw" -w "$workdir" --rootfs "$ROOTFS" \
       npx --yes "@openchamber/web@$OPENCHAMBER_VERSION" --foreground --port 3000 8<&- 9<&- >/dev/null; then
       warn "OpenChamber could not start. OpenCode is available."
     fi
@@ -593,7 +592,7 @@ require_unmounted_path() {
   local path=$1 mount
   [ ! -L "$path" ] && [ "$(realpath -m -- "$path")" = "$path" ] ||
     die "path must not be a symlink: $path"
-  mount=$(project_mountpoint "$path") || die "could not check mounts under $path"
+  mount=$(mountpoint_under "$path") || die "could not check mounts under $path"
   [ -z "$mount" ] || die "path includes mountpoint $mount"
 }
 
@@ -647,11 +646,6 @@ replace_rootfs() (
 
   printf 'Preparing the shared filesystem…\n'
   unpack_image "$stage/new"
-  # The extracted filesystem needs the shared SELinux label.
-  if [ "$(podman_selinux)" = true ]; then
-    printf 'Labeling the shared filesystem for SELinux…\n'
-    podman unshare chcon -Rh -t container_file_t -l s0 -- "$stage/new"
-  fi
 
   version=$(rootfs_opencode_version "$stage/new")
 
@@ -689,167 +683,13 @@ require_idle_data() {
   podman rm --force --ignore "${sessions[@]}" >/dev/null
 }
 
-podman_selinux() {
-  podman info --format '{{and .Host.Security.SELinuxEnabled (not .Host.ServiceIsRemote)}}' 2>/dev/null
-}
-
-record_labeled_project() (
-  local identity key ledger=$DATA/.selinux-default-projects
-  identity=$(stat -Lc '%d:%i' -- "$1") || exit 1
-  umask 077
-  [ ! -L "$ledger" ] && { [ ! -e "$ledger" ] || [ -f "$ledger" ]; } || exit 1
-  exec 7>> "$ledger" || exit 1
-  flock -x 7 || exit 1
-  key=$identity$'\t'$1
-  if grep -Fxq -- "$key" "$ledger"; then exit 0; fi
-  printf '%s\n' "$key" >&7
-)
-
-project_mountpoint() {
+mountpoint_under() {
   local mounts mount
   mounts=$(findmnt -rno TARGET) || return 1
   while IFS= read -r mount; do
     printf -v mount '%b' "$mount"
     if contains_path "$1" "$mount"; then printf '%s\n' "$mount"; return 0; fi
   done <<< "$mounts"
-}
-
-project_mount_mode() {
-  local enabled context diagnostics mount
-  enabled=$(podman_selinux) || die "could not check Podman's SELinux status"
-  if [ "$enabled" = false ]; then printf '%s\n' rw; return; fi
-  [ "$enabled" = true ] || die "could not check Podman's SELinux status"
-  context=$(stat -c %C -- "$1") || die "could not read the SELinux label of $1"
-  case "$context" in
-    *:object_r:container_file_t:s0) printf '%s\n' rw; return ;;
-    *:object_r:container_file_t:*)
-      printf 'SELinux labels kept on %q. To preview a reset, run restorecon -nRFvx -- %q\n' "$1" "$1" >&2
-      return 1 ;;
-  esac
-  command -v restorecon >/dev/null || die "install policycoreutils to check SELinux project labels"
-  # Podman's relabel can cross mountpoints; our check and cleanup must not.
-  mount=$(project_mountpoint "$1") || die "could not check mountpoints under $1"
-  [ -z "$mount" ] || die "refusing to relabel $1: it includes mountpoint $mount"
-  diagnostics=$(restorecon -nRFvxI -- "$1" 2>&1 | sed -n '1p') ||
-    die "could not check SELinux labels under $1: $diagnostics"
-  if [ -n "$diagnostics" ]; then
-    printf 'SELinux labels kept under %q. To preview a reset, run restorecon -nRFvx -- %q\n' "$1" "$1" >&2
-    return 1
-  fi
-  # Podman can relabel the project even if the container fails to start.
-  record_labeled_project "$1" || die "could not record SELinux cleanup path: $1"
-  printf '%s\n' z
-}
-
-read_labeled_projects() {
-  local -n projects=$1
-  local ledger=$DATA/.selinux-default-projects entry project identity
-  [ ! -L "$ledger" ] && [ -f "$ledger" ] || return 0
-  while IFS= read -r entry; do
-    project=${entry#*$'\t'}
-    identity=${entry%%$'\t'*}
-    if [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]] && is_home_subdirectory "$project"; then
-      projects["$project"]=$identity
-    fi
-  done < "$ledger"
-}
-
-show_project_label_cleanup() {
-  local -A recorded=()
-  read_labeled_projects recorded || return 1
-  [ "${#recorded[@]}" -gt 0 ] || return 0
-  local -a projects=("${!recorded[@]}")
-  printf 'Projects recorded for SELinux cleanup:\n'
-  printf '  %q\n' "${projects[@]}"
-  [ "${1:-}" = manual ] || return 0
-  cat <<'HELP'
-To handle labels manually, stop containers using the folder and unmount any nested mounts.
-For each listed project, set project to its current path.
-HELP
-  printf '  project=%q\n' "${projects[0]}"
-  cat <<'HELP'
-  # Preview the label changes
-  find "$project" -xdev -context '*:object_r:container_file_t:s0' -print0 | restorecon -nFv -0 -f -
-  # Apply the changes after reviewing the preview
-  find "$project" -xdev -context '*:object_r:container_file_t:s0' -print0 | restorecon -Fv -0 -f -
-Then run opencave uninstall --keep-labels after handling all listed folders.
-HELP
-}
-
-reset_project_labels() {
-  local ledger=$DATA/.selinux-default-projects project ids mounts mount current busy diagnostics inode
-  local -A recorded=()
-  local -a containers=() active_mounts=() pending=()
-  read_labeled_projects recorded || return 1
-  [ "${#recorded[@]}" -gt 0 ] || return 0
-
-  if ! command -v restorecon >/dev/null ||
-    [ "$(podman_selinux)" != true ]; then
-    printf 'SELinux cleanup needs restorecon and an SELinux-enabled host. Pending folders:\n' >&2
-    printf '  %q\n' "${!recorded[@]}" >&2
-    return 1
-  fi
-
-  ids=$(podman ps -q --all --filter status=running --filter status=paused) ||
-    { printf 'SELinux cleanup pending. Could not check active Podman containers.\n' >&2; return 1; }
-  if [ -n "$ids" ]; then
-    mapfile -t containers <<< "$ids"
-    mounts=$(podman container inspect --format '{{range .Mounts}}{{println .Source}}{{end}}' "${containers[@]}") ||
-      { printf 'SELinux cleanup pending. Could not check active Podman mounts.\n' >&2; return 1; }
-    while IFS= read -r mount; do
-      [[ "$mount" = /* ]] || continue
-      current=$(realpath -e -- "$mount" 2>/dev/null) || current=$mount
-      active_mounts+=("$current")
-    done <<< "$mounts"
-  fi
-
-  for project in "${!recorded[@]}"; do
-    # Device numbers can change across mounts; the inode is the stable identity.
-    inode=$(stat -Lc '%i' -- "$project" 2>/dev/null) || inode=
-    if [ ! -d "$project" ] || [ "$(realpath -e -- "$project" 2>/dev/null)" != "$project" ] ||
-      [ -z "$inode" ] || [ "$inode" != "${recorded[$project]#*:}" ] ||
-      paths_overlap "$project" "$DATA" || paths_overlap "$project" "$SCRIPT_DIR"; then
-      printf 'SELinux cleanup pending for %q. If moved, return the original folder to this path and retry.\n' "$project" >&2
-      pending+=("${recorded[$project]}"$'\t'"$project")
-      continue
-    fi
-    busy=no
-    for mount in "${active_mounts[@]}"; do
-      if paths_overlap "$project" "$mount"; then busy=yes; break; fi
-    done
-    if [ "$busy" = yes ]; then
-      printf 'SELinux cleanup pending for %q. Stop the container using it and retry.\n' "$project" >&2
-      pending+=("${recorded[$project]}"$'\t'"$project")
-      continue
-    fi
-    if ! mount=$(project_mountpoint "$project") || [ -n "$mount" ]; then
-      printf 'SELinux cleanup pending for %q. Check for nested mounts and retry.\n' "$project" >&2
-      pending+=("${recorded[$project]}"$'\t'"$project")
-      continue
-    fi
-    # Leave any later non-:z labels alone.
-    if ! diagnostics=$(
-      { find "$project" -xdev -context '*:object_r:container_file_t:s0' -print0 |
-        restorecon -F -0 -f -; } 2>&1
-    ) || [ -n "$diagnostics" ]; then
-      [ -z "$diagnostics" ] || printf '%s\n' "$diagnostics" >&2
-      printf 'SELinux cleanup pending for %q. Label restoration did not complete.\n' "$project" >&2
-      pending+=("${recorded[$project]}"$'\t'"$project")
-    else
-      printf 'Restored SELinux labels under %q.\n' "$project"
-    fi
-  done
-  if [ "${#pending[@]}" -eq 0 ]; then
-    rm -f -- "$ledger"
-    return
-  fi
-
-  local tmp
-  tmp=$(mktemp "$DATA/.selinux-default-projects.XXXXXX") || return 1
-  if ! printf '%s\n' "${pending[@]}" > "$tmp" || ! mv -f -- "$tmp" "$ledger"; then
-    rm -f -- "$tmp"
-  fi
-  return 1
 }
 
 serve() {
@@ -1083,7 +923,6 @@ uninstall() {
     printf 'Data kept: %s (shared or unmarked)\n' "$DATA"
   fi
   if [ -f "$marker" ] && [ ! -L "$marker" ] && [ "$(< "$marker")" = "$SCRIPT_DIR" ] &&
-    [ ! -e "$SCRIPT_DIR/.git" ] && [ ! -L "$SCRIPT_DIR/.git" ] &&
     ! contains_path "$SCRIPT_DIR" "$HOME_DIR" && ! contains_path "$SCRIPT_DIR" "$WORKSPACE" &&
     { [ "$delete_data" = yes ] || ! contains_path "$SCRIPT_DIR" "$DATA"; }; then
     delete_source=yes
@@ -1091,10 +930,8 @@ uninstall() {
   fi
   if [ "$yes_flag" = no ]; then
     [ -t 0 ] || die "use --yes for unattended uninstall"
-    if [ "$keep_labels" = no ]; then show_project_label_cleanup; fi
     if ! ask_yes "Uninstall OpenCave?" no; then
       printf 'Uninstall cancelled.\n'
-      if [ "$keep_labels" = no ]; then show_project_label_cleanup manual; fi
       return 0
     fi
   fi
@@ -1106,11 +943,6 @@ uninstall() {
   require_idle_data
   if [ "$delete_data" = yes ]; then require_unmounted_path "$DATA"; fi
   if [ "$delete_source" = yes ]; then require_unmounted_path "$SCRIPT_DIR"; fi
-  if [ "$keep_labels" = no ] && ! reset_project_labels; then
-    printf 'Uninstall paused. Rerun opencave uninstall to retry.\n' >&2
-    show_project_label_cleanup manual >&2
-    return 1
-  fi
   if ! remove_owned_images; then
     printf 'Image cleanup pending. Check the Podman output and rerun opencave uninstall.\n' >&2
     return 1
@@ -1129,7 +961,7 @@ uninstall() {
 
 open_session() {
   require_install
-  local mode=$1 dir name mount_mode workdir=/root
+  local mode=$1 dir name workdir=/root
   shift
   local -a mounts=() args=(opencode --standalone)
   if [ "$mode" = shell ]; then
@@ -1142,6 +974,7 @@ open_session() {
     require_project_mount "$dir"
     name=${dir##*/}
     workdir=/workspace/${name:-workspace}
+    mounts=(-v "$dir:$workdir:rw")
   fi
 
   require_rootfs
@@ -1149,10 +982,6 @@ open_session() {
   exec 8< "$DATA"
   flock -sn 8 || die "OpenCave is busy. Retry after the current maintenance command finishes."
   [ -f "$ENV_FILE" ] || die "OpenCave was uninstalled"
-  if [ "$mode" != shell ]; then
-    mount_mode=$(project_mount_mode "$dir") || exit 1
-    mounts=(-v "$dir:$workdir:$mount_mode")
-  fi
   podman run --rm -it --label "$IMAGE_OWNER=$SCRIPT_DIR" "${ROOTFS_OPTIONS[@]}" --env "PATH=$ROOTFS_PATH" \
     "${mounts[@]}" -w "$workdir" --rootfs "$ROOTFS" "${args[@]}" 8<&-
 }
@@ -1233,14 +1062,11 @@ case "$cmd" in
   session|shell) open_session "$cmd" "$@"; exit ;;
 esac
 
-yes_flag=no import_first=yes update_system=no keep_labels=no
+yes_flag=no import_first=yes update_system=no
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --no-import-auth) import_first=no ;;
     --yes) yes_flag=yes ;;
-    --keep-labels)
-      [ "$cmd" = uninstall ] || die "--keep-labels is for uninstall"
-      keep_labels=yes ;;
     --system)
       [ "$cmd" = update ] || die "--system is for update"
       update_system=yes ;;
