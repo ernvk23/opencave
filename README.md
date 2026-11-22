@@ -1,6 +1,6 @@
 # OpenCave
 
-A rootless Podman container for [OpenCode](https://opencode.ai). Host file access is scoped to the mounted folder only. Optional [OpenChamber](https://openchamber.dev) web UI.
+A rootless Podman container for [OpenCode](https://opencode.ai). By default, host file access is scoped to the mounted project. Optional [OpenChamber](https://openchamber.dev) web UI.
 
 ## Overview
 
@@ -29,7 +29,7 @@ Or run `./setup.sh` from a checkout.
 
 ```sh
 opencave [DIR]                   # OpenCode in a project
-opencave shell                   # Open a shell
+opencave shell                   # Open Bash in the container's /root (no project needed)
 opencave serve [DIR]             # Start OpenCode web UI
 opencave serve [DIR] --openchamber # Add the OpenChamber UI
 opencave import-skills [DIR]     # Import host skills
@@ -41,6 +41,20 @@ opencave reset                   # Clear chats and packages, keep provider login
 ```
 
 More commands: `opencave help`.
+
+### Host Podman socket (optional)
+
+If the socket isn’t active, run `systemctl --user enable --now podman.socket` on the host.
+
+```sh
+opencave --socket [DIR]           # OpenCode in a project with host Podman access
+opencave shell --socket           # Open Bash in the container's /root (no project needed), with host Podman access
+opencave serve --socket [DIR]     # Start OpenCode web UI with host Podman access
+```
+
+`docker`, `docker compose`, `podman`, and `podman compose` all use host Podman. Older installs can add the clients with `opencave update --system`.
+
+**Trusted sessions only:** `--socket` grants access to host files and the host Podman engine. Resources it creates survive OpenCave uninstall.
 
 ## Uninstall
 

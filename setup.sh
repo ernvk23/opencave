@@ -35,16 +35,20 @@ usage() {
   cat <<'HELP'
 opencave                    Open a TUI in the current folder
 opencave DIR                Open a TUI in DIR
-opencave shell              Open Bash with shared tools and config
+opencave --socket [DIR]      Open a TUI with access to the host Podman socket
+opencave shell              Open Bash in the container's /root (no project needed)
+opencave shell --socket     Same shell, with access to the host Podman socket
 opencave help               Show this help
 
 opencave serve [DIR]        Start the OpenCode web UI
                             (default: current folder)
+opencave serve --socket [DIR]
+                            Start the web UI with access to the host Podman socket
 opencave serve [DIR] --openchamber
                             Add the OpenChamber UI
 opencave serve-stop         Stop the server
 opencave serve-restart      Restart the last server
-                            (keeps a running OpenChamber)
+                            (keeps socket access and a running OpenChamber)
 opencave serve-status       Show server status
 opencave serve-logs [openchamber]
                             Follow OpenCode logs (or OpenChamber)
@@ -225,6 +229,14 @@ openchamber_running() {
   server_running opencave-openchamber
 }
 
+server_has_socket() {
+  local state
+  state=$(podman container inspect --format \
+    "{{index .Config.Labels \"$IMAGE_OWNER\"}}{{range .Config.Env}}{{if eq . \"OPENCAVE_SOCKET=1\"}}{{println}}{{print \"socket\"}}{{end}}{{end}}" \
+    opencave 2>/dev/null) || return 1
+  [ "$state" = "$SCRIPT_DIR"$'\n'socket ]
+}
+
 server_containers() {
   [ -n "$(podman ps -aq --filter 'name=^opencave(-openchamber)?$' 2>/dev/null)" ]
 }
@@ -265,6 +277,7 @@ start_server() (
   require_project_mount "$WORKSPACE"
   require_rootfs
   workdir=/workspace/${name:-workspace}
+  if [ "$#" -gt 0 ]; then workdir=$WORKSPACE; fi
   if [ "$OPENCHAMBER" = yes ] && [ -n "$OPENCHAMBER_UI_PASSWORD" ]; then
     ports+=(-p "127.0.0.1:$OPENCHAMBER_PORT:3000")
   fi
@@ -272,7 +285,7 @@ start_server() (
   podman run -d --name opencave --restart unless-stopped \
     --label "$IMAGE_OWNER=$SCRIPT_DIR" \
     "${ROOTFS_OPTIONS[@]}" "${ports[@]}" --env "PATH=$ROOTFS_PATH" \
-    --env OPENCODE_SERVER_PASSWORD \
+    --env OPENCODE_SERVER_PASSWORD "$@" \
     -v "$WORKSPACE:$workdir:rw" -w "$workdir" --rootfs "$ROOTFS" \
     opencode serve --hostname 0.0.0.0 --port 4096 8<&- 9<&- >/dev/null ||
     die "could not start OpenCode"
@@ -612,6 +625,19 @@ unpack_image() (
     podman unshare tar -xpf - -C "$destination" 8<&- 9<&-
 )
 
+container_clients_installed() {
+  [ -x "$1/usr/bin/docker" ] && [ -x "$1/usr/bin/docker-compose" ] &&
+    [ -x "$1/usr/bin/podman" ]
+}
+
+install_container_clients() {
+  if container_clients_installed "$1"; then return 0; fi
+  podman run --rm "${ROOTFS_OPTIONS[@]}" --rootfs "$1" /bin/sh -ec '
+    apk add --no-cache docker-cli docker-cli-compose podman-remote
+    ln -sf podman-remote /usr/bin/podman
+  ' 8<&- 9<&- || die "could not install Docker and Podman clients; check Alpine repository access and retry"
+}
+
 restore_rootfs() {
   if [ -d "$stage/old" ]; then
     if [ -d "$ROOTFS" ]; then mv -T -- "$ROOTFS" "$stage/failed" || return 1; fi
@@ -646,6 +672,7 @@ replace_rootfs() (
 
   printf 'Preparing the shared filesystem…\n'
   unpack_image "$stage/new"
+  install_container_clients "$stage/new"
 
   version=$(rootfs_opencode_version "$stage/new")
 
@@ -683,6 +710,19 @@ require_idle_data() {
   podman rm --force --ignore "${sessions[@]}" >/dev/null
 }
 
+prepare_socket() {
+  local socket
+  local -n options=$1
+  socket=$(absolute_path "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock") || exit 1
+  [ -S "$socket" ] || die "Podman socket not found at $socket; run 'systemctl --user enable --now podman.socket'"
+  require_rootfs
+  container_clients_installed "$ROOTFS" || die "container clients are missing; run 'opencave update --system'"
+  options=(-v "$socket:/var/run/docker.sock" --env DOCKER_HOST=unix:///var/run/docker.sock
+    --env CONTAINER_HOST=unix:///var/run/docker.sock --env PODMAN_COMPOSE_PROVIDER=/usr/bin/docker-compose
+    --env OPENCAVE_SOCKET=1)
+  warn "Socket access grants control of your host Podman engine and access to your host files. Resources created through it survive OpenCave uninstall."
+}
+
 mountpoint_under() {
   local mounts mount
   mounts=$(findmnt -rno TARGET) || return 1
@@ -694,9 +734,11 @@ mountpoint_under() {
 
 serve() {
   require_install
-  local dir= openchamber= port=
+  local dir= openchamber= port= use_socket=no
+  local -a socket_args=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
+      --socket) use_socket=yes ;;
       --openchamber) openchamber=yes ;;
       --no-openchamber) openchamber=no ;;
       --port)
@@ -710,7 +752,7 @@ serve() {
       -*)
         die "unexpected argument: $1 (see opencave help)" ;;
       *)
-        [ -z "$dir" ] || die "usage: opencave serve [DIR]"
+        [ -z "$dir" ] || die "usage: opencave serve [--socket] [DIR]"
         dir=$1 ;;
     esac
     shift
@@ -742,13 +784,15 @@ serve() {
   if [ "$OPENCHAMBER" = yes ] && port_busy "$OPENCHAMBER_PORT"; then
     die "port $OPENCHAMBER_PORT is already in use; set OPENCHAMBER_PORT in $ENV_FILE"
   fi
+  if [ "$use_socket" = yes ]; then prepare_socket socket_args; fi
   write_config
-  start_server
+  start_server "${socket_args[@]}"
 }
 
 serve_restart() {
   require_install
   local openchamber=
+  local -a socket_args=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --openchamber) openchamber=yes ;;
@@ -774,6 +818,7 @@ serve_restart() {
     [ "$OPENCHAMBER_PORT" != "$PORT" ] || die "OpenCode and OpenChamber need different host ports"
     OPENCHAMBER_UI_PASSWORD=${OPENCHAMBER_UI_PASSWORD:-$(password)}
   fi
+  if server_has_socket; then prepare_socket socket_args; fi
   stop_server
   if port_busy "$PORT"; then
     die "port $PORT is already in use; check what is running and retry"
@@ -782,7 +827,7 @@ serve_restart() {
     die "port $OPENCHAMBER_PORT is already in use; set OPENCHAMBER_PORT in $ENV_FILE"
   fi
   write_config
-  start_server
+  start_server "${socket_args[@]}"
 }
 
 serve_stop() {
@@ -806,6 +851,7 @@ serve_status() {
     printf 'OpenCave server is not running.\n'
     printf 'Last folder: %s\n' "${WORKSPACE:-none}"
   fi
+  if server_has_socket; then printf 'Podman socket: on\n'; else printf 'Podman socket: off\n'; fi
   podman ps -a --filter 'name=^opencave(-openchamber)?$' || true
 }
 
@@ -853,6 +899,7 @@ update_command() {
   if [ "$update_system" = yes ]; then
     podman run --rm "${ROOTFS_OPTIONS[@]}" --rootfs "$ROOTFS" \
       apk upgrade --no-cache 8<&- 9<&- || die "could not upgrade Alpine packages"
+    install_container_clients "$ROOTFS"
   fi
   before=$(rootfs_opencode_version "$ROOTFS") || die "could not check the installed OpenCode version"
   if [ "$OPENCODE_TAG" != "$before" ]; then
@@ -961,19 +1008,21 @@ uninstall() {
 
 open_session() {
   require_install
-  local mode=$1 dir name workdir=/root
+  local mode=$1 dir name workdir=/root use_socket=no
   shift
-  local -a mounts=() args=(opencode --standalone)
+  local -a mounts=() socket_args=() args=(opencode --standalone)
+  if [ "${1:-}" = --socket ]; then use_socket=yes; shift; fi
   if [ "$mode" = shell ]; then
-    [ "$#" -eq 0 ] || die "usage: opencave shell"
+    [ "$#" -eq 0 ] || die "usage: opencave shell [--socket]"
     args=(/bin/bash)
   else
-    [ "$#" -le 1 ] || die "usage: opencave [DIR]"
+    [ "$#" -le 1 ] || die "usage: opencave [--socket] [DIR]"
     dir=$(absolute_path "${1:-$CALL_DIR}") || exit 1
     [ -d "$dir" ] || die "not a directory: $dir"
     require_project_mount "$dir"
     name=${dir##*/}
     workdir=/workspace/${name:-workspace}
+    if [ "$use_socket" = yes ]; then workdir=$dir; fi
     mounts=(-v "$dir:$workdir:rw")
   fi
 
@@ -982,8 +1031,9 @@ open_session() {
   exec 8< "$DATA"
   flock -sn 8 || die "OpenCave is busy. Retry after the current maintenance command finishes."
   [ -f "$ENV_FILE" ] || die "OpenCave was uninstalled"
+  if [ "$use_socket" = yes ]; then prepare_socket socket_args; fi
   podman run --rm -it --label "$IMAGE_OWNER=$SCRIPT_DIR" "${ROOTFS_OPTIONS[@]}" --env "PATH=$ROOTFS_PATH" \
-    "${mounts[@]}" -w "$workdir" --rootfs "$ROOTFS" "${args[@]}" 8<&-
+    "${socket_args[@]}" "${mounts[@]}" -w "$workdir" --rootfs "$ROOTFS" "${args[@]}" 8<&-
 }
 
 case "${1:-}" in
@@ -999,6 +1049,7 @@ case "$cmd" in
     shift ;;
   '')
     if [ "${0##*/}" = opencave ]; then cmd=session; else cmd=setup; fi ;;
+  --socket) cmd=session ;;
   -*) cmd=setup ;;
   *) cmd=session ;;
 esac
